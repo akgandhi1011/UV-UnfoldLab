@@ -29,6 +29,8 @@ Create a new GitHub repository from this clean package and run the workflow:
 
 `Build RotateUV Native Unfold V2 + Standard Geometry V2.2`
 
+The workflow checks out libigl v2.6.0 and downloads the official Eigen 3.4.0 release archive from GitLab. Eigen is not checked out through the former `libigl/eigen` GitHub step, avoiding that CI failure point.
+
 The artifact is:
 
 `RotateUV-Native-Unfold-V2-Windows`
