@@ -1,0 +1,82 @@
+name: Build RotateUV Native Unfold V2 + Standard Geometry V2.2
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/**'
+      - 'Rotate_UV_PRO_NATIVE_UNFOLD_V2.ms'
+      - 'Rotate_UV_PRO_NATIVE_UNFOLD_V2.mcr'
+      - '.github/workflows/build-windows.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout RotateUV repository
+        uses: actions/checkout@v4
+
+      - name: Checkout libigl 2.6.0
+        uses: actions/checkout@v4
+        with:
+          repository: libigl/libigl
+          ref: v2.6.0
+          path: third_party/libigl
+          fetch-depth: 1
+
+      - name: Checkout Eigen 3.4.0
+        uses: actions/checkout@v4
+        with:
+          repository: libigl/eigen
+          ref: 3.4.0
+          path: third_party/eigen
+          fetch-depth: 1
+
+      - name: Enable MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Prepare output
+        shell: cmd
+        run: if not exist dist mkdir dist
+
+      - name: Build Auto Seam V2.2 worker
+        shell: cmd
+        run: |
+          cl /nologo /O2 /DNDEBUG /std:c++17 /EHsc /MD src\autoseam_worker.cpp /Fe:dist\RotateUV_AutoSeam.exe
+
+      - name: Build Native Unfold V2 worker with libigl
+        shell: cmd
+        run: |
+          cl /nologo /O2 /DNDEBUG /std:c++17 /EHsc /MD /bigobj /Ithird_party\libigl\include /Ithird_party\eigen src\unfold_worker.cpp /Fe:dist\RotateUV_Unfold.exe
+
+      - name: Smoke test workers
+        shell: pwsh
+        run: |
+          & 'dist\RotateUV_AutoSeam.exe'
+          $seamCode = $LASTEXITCODE
+          if ($seamCode -ne 2) { throw "Auto Seam worker usage test failed: $seamCode" }
+
+          & 'dist\RotateUV_Unfold.exe'
+          $unfoldCode = $LASTEXITCODE
+          if ($unfoldCode -ne 2) { throw "Native Unfold V2 worker usage test failed: $unfoldCode" }
+
+          exit 0
+
+      - name: Copy MaxScript and notices
+        shell: pwsh
+        run: |
+          Copy-Item Rotate_UV_PRO_NATIVE_UNFOLD_V2.ms dist\ -Force
+          Copy-Item Rotate_UV_PRO_NATIVE_UNFOLD_V2.mcr dist\ -Force
+          Copy-Item README.md dist\README_NATIVE_UNFOLD_V2.md -Force
+          Copy-Item THIRD_PARTY_NOTICES.md dist\THIRD_PARTY_NOTICES.md -Force
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: RotateUV-Native-Unfold-V2-Windows
+          path: dist/*
+          if-no-files-found: error
