@@ -26,13 +26,33 @@ jobs:
           path: third_party/libigl
           fetch-depth: 1
 
-      - name: Checkout Eigen 3.4.0
-        uses: actions/checkout@v4
-        with:
-          repository: libigl/eigen
-          ref: 3.4.0
-          path: third_party/eigen
-          fetch-depth: 1
+      # Do not checkout libigl/eigen as a second GitHub repository. That
+      # checkout is the failure point seen in CI. Pull the official Eigen
+      # 3.4.0 release archive instead and validate the expected headers.
+      - name: Fetch Eigen 3.4.0
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force third_party | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP 'eigen-3.4.0.zip'
+          $unpack = Join-Path $env:RUNNER_TEMP 'eigen-3.4.0-unpack'
+          if (Test-Path $unpack) { Remove-Item $unpack -Recurse -Force }
+
+          curl.exe -L --fail --retry 5 --retry-delay 3 --retry-all-errors `
+            -o $zip `
+            'https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.zip'
+          if ($LASTEXITCODE -ne 0) { throw "Eigen 3.4.0 download failed with exit code $LASTEXITCODE" }
+
+          Expand-Archive -Path $zip -DestinationPath $unpack -Force
+          $src = Join-Path $unpack 'eigen-3.4.0'
+          if (-not (Test-Path (Join-Path $src 'Eigen\Core'))) {
+            throw 'Eigen archive extracted, but Eigen/Core was not found.'
+          }
+
+          $dst = 'third_party\eigen'
+          if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
+          Move-Item $src $dst
+          Write-Host 'Eigen 3.4.0 ready at third_party/eigen'
 
       - name: Enable MSVC x64
         uses: ilammy/msvc-dev-cmd@v1
