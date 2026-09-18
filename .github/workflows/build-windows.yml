@@ -1,10 +1,11 @@
-name: Build RotateUV Native Unfold V2.5 FINAL
+name: Build and test RotateUV Native Unfold V3
 
 on:
   workflow_dispatch:
   push:
     paths:
       - 'src/**'
+      - 'tests/**'
       - 'Rotate_UV_PRO_NATIVE_UNFOLD_V2.ms'
       - 'Rotate_UV_PRO_NATIVE_UNFOLD_V2.mcr'
       - '.github/workflows/build-windows.yml'
@@ -63,12 +64,12 @@ jobs:
         shell: cmd
         run: if not exist dist mkdir dist
 
-      - name: Build Topology-Aware Auto Seam V2.5 worker
+      - name: Build Auto Seam V3 worker
         shell: cmd
         run: |
           cl /nologo /O2 /DNDEBUG /std:c++17 /EHsc /MD src\autoseam_worker.cpp /Fe:dist\RotateUV_AutoSeam.exe
 
-      - name: Build Native Unfold V2 worker with libigl
+      - name: Build Native Unfold V3 worker with libigl
         shell: cmd
         run: |
           cl /nologo /O2 /DNDEBUG /std:c++17 /EHsc /MD /bigobj /Ithird_party\libigl\include /Ithird_party\eigen src\unfold_worker.cpp /Fe:dist\RotateUV_Unfold.exe
@@ -82,21 +83,51 @@ jobs:
 
           & 'dist\RotateUV_Unfold.exe'
           $unfoldCode = $LASTEXITCODE
-          if ($unfoldCode -ne 2) { throw "Native Unfold V2 worker usage test failed: $unfoldCode" }
+          if ($unfoldCode -ne 2) { throw "Native Unfold worker usage test failed: $unfoldCode" }
+
+          # Version handshake: the MaxScript refuses workers older than 3.0.0
+          $seamVer = & 'dist\RotateUV_AutoSeam.exe' --version
+          if ($LASTEXITCODE -ne 0) { throw "Auto Seam --version failed" }
+          Write-Host "AutoSeam: $seamVer"
+          if ($seamVer -notmatch 'RotateUV_AutoSeam\s+3\.') { throw "Unexpected Auto Seam version: $seamVer" }
+
+          $unfoldVer = & 'dist\RotateUV_Unfold.exe' --version
+          if ($LASTEXITCODE -ne 0) { throw "Native Unfold --version failed" }
+          Write-Host "Unfold: $unfoldVer"
+          if ($unfoldVer -notmatch 'RotateUV_Unfold\s+3\.') { throw "Unexpected Native Unfold version: $unfoldVer" }
 
           exit 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Golden-mesh regression tests
+        shell: pwsh
+        run: |
+          python tests/make_fixtures.py
+          python tests/run_tests.py dist\RotateUV_Unfold.exe
+          if ($LASTEXITCODE -ne 0) { throw "Solver regression tests failed" }
+
+      - name: End-to-end seam and unfold tests
+        shell: pwsh
+        run: |
+          python tests/run_pipeline.py dist\RotateUV_AutoSeam.exe dist\RotateUV_Unfold.exe
+          if ($LASTEXITCODE -ne 0) { throw "Pipeline regression tests failed" }
 
       - name: Copy MaxScript and notices
         shell: pwsh
         run: |
           Copy-Item Rotate_UV_PRO_NATIVE_UNFOLD_V2.ms dist\ -Force
           Copy-Item Rotate_UV_PRO_NATIVE_UNFOLD_V2.mcr dist\ -Force
-          Copy-Item README.md dist\README_NATIVE_UNFOLD_V2.md -Force
+          Copy-Item README.md dist\README.md -Force
+          Copy-Item CHANGES.md dist\CHANGES.md -Force
           Copy-Item THIRD_PARTY_NOTICES.md dist\THIRD_PARTY_NOTICES.md -Force
 
       - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: RotateUV-Native-Unfold-V2-Windows
+          name: RotateUV-Native-Unfold-V3-Windows
           path: dist/*
           if-no-files-found: error
