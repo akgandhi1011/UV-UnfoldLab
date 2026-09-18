@@ -1,31 +1,21 @@
-# RotateUV Native Unfold V2 + Ideal Standard Geometry V2.3
+# RotateUV Native Unfold V2.4
 
-This repository builds the RotateUV 3ds Max tool with a native seam worker and native libigl unfold worker.
+## V2.4 changes
 
-## V2.3 Ideal Standard Geometry
+- `Ideal Standard` is no longer a separate profile. Standard-geometry recognition is embedded in **Minimal Seams**.
+- **Minimal Seams** is now the default profile.
+- 3ds Max **Tube** is distinguished from a smooth torus even though both are genus-1 topologies. Sharp axial Tube geometry is handled before torus recognition.
+- Tube output targets clean structural loops plus controlled openings instead of selecting nearly every edge.
+- Smooth torus recognition is stricter, preventing sharp Tube primitives from entering the torus path.
+- ChamferBox/hard-surface nets now reject clearly under-cut 2-3 edge results and fall through to a more appropriate structured/fallback solution.
+- Standard Box behavior is preserved.
 
-The seam planner now uses high-confidence topology-first patterns before falling back to the general feature-aware planner.
+### Profiles
 
-- **Box / rectangular hard-surface solids:** creates a connected panel net by keeping a spanning tree of face hinges. It does **not** mark every box edge as a seam.
-- **ChamferBox / beveled extrusions:** treats planar and chamfer regions as a panel graph and creates one connected low-cut net.
-- **Cylinder:** separates caps and opens the side wall with one longitudinal seam.
-- **Hollow Tube:** separates the outer/inner walls from annular caps, opens outer and inner walls longitudinally, and opens annular caps radially.
-- **Torus / donut topology:** for smooth closed genus-1 meshes, creates one meridian cycle plus one longitude cycle rather than arbitrary partial rings.
-- **General meshes:** automatically fall back to the existing V2.2 feature-aware seam planner.
+1. Minimal Seams (default; includes automatic Box / ChamferBox / Cylinder / Tube / Torus recognition)
+2. Balanced
+3. Low Distortion
 
-The UI profile **Ideal Standard** is selected by default. Workflow remains:
+### Build
 
-`Generate -> Preview -> Apply -> Native Unfold`
-
-Native Unfold uses libigl LSCM initialization followed by SLIM symmetric-Dirichlet optimization.
-
-## Build
-
-GitHub Actions builds:
-
-- `RotateUV_AutoSeam.exe`
-- `RotateUV_Unfold.exe`
-- `Rotate_UV_PRO_NATIVE_UNFOLD_V2.ms`
-- `Rotate_UV_PRO_NATIVE_UNFOLD_V2.mcr`
-
-The workflow uses libigl 2.6.0 and Eigen 3.4.0.
+Use the included `.github/workflows/build-windows.yml` workflow. The repository contains the MaxScript UI, auto-seam worker and native unfold worker.

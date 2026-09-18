@@ -116,7 +116,6 @@ struct Profile {
 static Profile profileFromBound(double bound){
     Profile p;
     if(bound>=6.5){p.name="Minimal Seams";p.featureAngle=52.0;p.planarAngle=5.0;p.minRegionAreaFrac=0.008;}
-    else if(bound<=3.8){p.name="Ideal Standard";p.featureAngle=30.0;p.planarAngle=7.0;p.minRegionAreaFrac=0.002;}
     else if(bound<=4.6){p.name="Low Distortion";p.featureAngle=26.0;p.planarAngle=8.0;p.minRegionAreaFrac=0.002;}
     return p;
 }
@@ -332,7 +331,7 @@ static bool tryAxialStandardAssist(
 
 
 
-// V2.3 Ideal Standard Geometry helpers -------------------------------------------------
+// V2.4 automatic Standard Geometry helpers -------------------------------------------------
 // High-confidence topology-first patterns are attempted before the generic planner:
 //   * Box / chamfer-box / extruded hard-surface solids -> one connected patch net.
 //   * Cylinder / hollow tube -> cap separator loops + one opening per resulting band.
@@ -395,8 +394,11 @@ static bool tryHardSurfaceIdealNet(
 
     cuts.clear();
     for(const auto&a:adjs){if(!keep.count({a.a,a.b}))for(const auto&e:a.edges){auto it=t.edges.find(e);if(it!=t.edges.end()&&!it->second.openBoundary)cuts.insert(e);}}
-    // Sanity: a closed P-patch shell needs roughly (all adjacencies - (P-1)) cut boundaries.
-    return !cuts.empty();
+    // Sanity: a closed hard-surface shell with many planar/chamfer patches cannot be
+    // represented by only a tiny slit. Reject under-cut results so another recognizer
+    // can take over rather than returning the 2-3 edge failure seen on ChamferBox.
+    const size_t minUsefulCuts = patches.size()<=8 ? 4u : std::max<size_t>(6u, patches.size()/3u);
+    return cuts.size()>=minUsefulCuts;
 }
 
 static bool jacobiSmallestEigenVector(const double Ain[3][3],Vec3&out){
@@ -434,12 +436,19 @@ static bool pickDirectionalClosedLoop(const ObjMesh&m,const MeshTopo&t,const std
     return !best.empty();
 }
 
+static double componentSharpLengthFraction(const MeshTopo&t,const std::vector<int>&comp,double angleDeg=35.0){
+    std::unordered_set<int>cf(comp.begin(),comp.end()); double sharp=0.0,total=0.0;
+    for(const auto&kv:t.edges){const auto&e=kv.second;if(e.faces.size()==2&&cf.count(e.faces[0])&&cf.count(e.faces[1])){total+=e.length;if(e.dihedralDeg>angleDeg)sharp+=e.length;}}
+    return total>1e-12?sharp/total:0.0;
+}
+
 static bool tryTorusIdealAssist(const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,std::set<EdgeKey>&cuts){
     if(comp.size()<24||!componentEulerGenusOne(m,t,comp))return false;
-    // Torus assist is for smooth genus-1 components only.
-    std::unordered_set<int>cf(comp.begin(),comp.end());double sharp=0,total=0;
-    for(const auto&kv:t.edges){const auto&e=kv.second;if(e.faces.size()==2&&cf.count(e.faces[0])&&cf.count(e.faces[1])){total+=e.length;if(e.dihedralDeg>35.0)sharp+=e.length;}}
-    if(total<=0||sharp/total>0.70)return false;
+    // Torus assist is strictly for a smooth genus-1 surface. A 3ds Max Tube is also
+    // genus-1 topologically, but has strong cap/wall creases and must be handled by
+    // the axial Tube recognizer instead.
+    std::unordered_set<int>cf(comp.begin(),comp.end());
+    if(componentSharpLengthFraction(t,comp,35.0)>0.18)return false;
     Vec3 ctr{};std::unordered_set<int>vs;for(int f:comp)for(const auto&co:m.faces[f].c)vs.insert(co.v);for(int v:vs)ctr=ctr+m.vertices[v-1];ctr=ctr/(double)vs.size();
     double C[3][3]={{0}};for(int v:vs){Vec3 d=m.vertices[v-1]-ctr;double q[3]={d.x,d.y,d.z};for(int i=0;i<3;i++)for(int j=0;j<3;j++)C[i][j]+=q[i]*q[j];}
     Vec3 axis;if(!jacobiSmallestEigenVector(C,axis))return false;
@@ -548,10 +557,23 @@ static std::set<EdgeKey> planFeatureAwareLegacy(const ObjMesh&m,const MeshTopo&t
 
 static std::set<EdgeKey> planFeatureAware(const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,const Profile&p){
     std::set<EdgeKey> structured;
-    // Order matters: genus-1 smooth surfaces first; then hard-surface nets; then axial tube/cylinder patterns.
-    if(tryTorusIdealAssist(m,t,comp,structured) ||
-       tryHardSurfaceIdealNet(m,t,comp,p,structured) ||
-       tryAxialStandardAssist(m,t,comp,p,structured)){
+    const bool genusOne=componentEulerGenusOne(m,t,comp);
+    const double sharpFrac=componentSharpLengthFraction(t,comp,35.0);
+
+    // Recognition is automatic inside every profile (especially Minimal Seams).
+    // A Max Tube and a torus are both genus-1. Distinguish them by structural creases:
+    // Tube -> axial cap/wall loops first; smooth torus -> meridian + longitude.
+    bool matched=false;
+    if(genusOne && sharpFrac>0.18) matched=tryAxialStandardAssist(m,t,comp,p,structured);
+    if(!matched && genusOne) matched=tryTorusIdealAssist(m,t,comp,structured);
+
+    // Genus-0 box/chamfer-box: preserve the proven box net first. Chamfered/extruded
+    // shapes get a coherent patch net; if that is under-cut, axial recognition gets
+    // a chance before generic feature-aware fallback.
+    if(!matched) matched=tryHardSurfaceIdealNet(m,t,comp,p,structured);
+    if(!matched) matched=tryAxialStandardAssist(m,t,comp,p,structured);
+
+    if(matched){
         for(auto it=structured.begin();it!=structured.end();){auto ei=t.edges.find(*it);if(ei!=t.edges.end()&&ei->second.openBoundary)it=structured.erase(it);else ++it;}
         return structured;
     }
@@ -562,7 +584,7 @@ static double parseBound(const std::string&s){try{return std::stod(s);}catch(...
 
 int main(int argc,char**argv){
     if(argc<4){
-        std::cerr<<"RotateUV Native Auto Seam V2.3 - Ideal Standard Geometry + Feature-Aware fallback\nUsage: RotateUV_AutoSeam.exe input.obj output.seams profileBound [legacyInitialCut]\n";return 2;
+        std::cerr<<"RotateUV Native Auto Seam V2.4 - Minimal Seams + automatic Standard Geometry recognition\nUsage: RotateUV_AutoSeam.exe input.obj output.seams profileBound [legacyInitialCut]\n";return 2;
     }
     fs::path inputPath=fs::absolute(argv[1]);fs::path outputPath=fs::absolute(argv[2]);double bound=parseBound(argv[3]);Profile prof=profileFromBound(bound);
     ObjMesh mesh;std::string err;if(!readTriObj(inputPath,mesh,err)){std::cerr<<err<<"\n";return 4;}MeshTopo topo=buildTopo(mesh);auto comps=faceComponents(mesh);
@@ -576,6 +598,6 @@ int main(int argc,char**argv){
     out<<"SEAMS "<<allCuts.size()<<"\n";
     for(auto&e:allCuts)out<<"SEAM "<<e.a<<" "<<e.b<<"\n";
     out<<"END\n";out.close();
-    std::cout<<"RotateUV Ideal Auto Seam V2.3: "<<allCuts.size()<<" seam edges | "<<prof.name<<" | components="<<comps.size()<<"\n";
+    std::cout<<"RotateUV Native Auto Seam V2.4: "<<allCuts.size()<<" seam edges | "<<prof.name<<" | components="<<comps.size()<<"\n";
     return 0;
 }
