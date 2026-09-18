@@ -116,6 +116,7 @@ struct Profile {
 static Profile profileFromBound(double bound){
     Profile p;
     if(bound>=6.5){p.name="Minimal Seams";p.featureAngle=52.0;p.planarAngle=5.0;p.minRegionAreaFrac=0.008;}
+    else if(bound<=3.8){p.name="Ideal Standard";p.featureAngle=30.0;p.planarAngle=7.0;p.minRegionAreaFrac=0.002;}
     else if(bound<=4.6){p.name="Low Distortion";p.featureAngle=26.0;p.planarAngle=8.0;p.minRegionAreaFrac=0.002;}
     return p;
 }
@@ -181,6 +182,9 @@ static bool looksLikeClosedLoop(const std::vector<EdgeKey>&es){
 // V2.1 structured standard-geometry assist.
 // This is intentionally a high-confidence pre-pass. If it cannot prove that a component
 // behaves like an axial/extruded solid, the original V2 feature-aware planner is used unchanged.
+static void addLongitudinalOpenings(const ObjMesh&,const MeshTopo&,const std::unordered_set<int>&,const Profile&,std::set<EdgeKey>&);
+static void pruneTinyBranches(const MeshTopo&,const Profile&,std::set<EdgeKey>&);
+
 struct PlanarLoopCandidate {
     std::vector<EdgeKey> edges;
     Vec3 center{};
@@ -318,8 +322,129 @@ static bool tryAxialStandardAssist(
     if(!dijkstraAxialSlit(m,t,rv,structuredLoops,src,dst,axis,slit))return false;
 
     cuts=structuredLoops;
-    for(auto&e:slit){auto it=t.edges.find(e);if(it!=t.edges.end()&&!it->second.openBoundary)cuts.insert(e);}
+    // Open every resulting band exactly once. For a solid cylinder this creates one
+    // longitudinal side slit. For a hollow Tube it additionally opens the inner wall
+    // and gives each annular cap one radial slit, producing clean rectangular/ring strips.
+    addLongitudinalOpenings(m,t,cf,p,cuts);
+    pruneTinyBranches(t,p,cuts);
     return !cuts.empty();
+}
+
+
+
+// V2.3 Ideal Standard Geometry helpers -------------------------------------------------
+// High-confidence topology-first patterns are attempted before the generic planner:
+//   * Box / chamfer-box / extruded hard-surface solids -> one connected patch net.
+//   * Cylinder / hollow tube -> cap separator loops + one opening per resulting band.
+//   * Smooth genus-1 torus -> one meridian cycle + one longitude cycle.
+// If confidence is low, the existing V2.2 feature-aware planner remains the fallback.
+
+struct PatchAdj {
+    int a=-1,b=-1;
+    std::vector<EdgeKey> edges;
+    double length=0.0;
+    double meanAngle=0.0;
+};
+
+static bool tryHardSurfaceIdealNet(
+    const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,const Profile&p,std::set<EdgeKey>&cuts)
+{
+    std::unordered_set<int> cf(comp.begin(),comp.end());
+    auto patches=planarPatches(m,t,cf,p);
+    // A standard hard-surface primitive should collapse to a modest number of planar regions.
+    if(patches.size()<4 || patches.size()>64) return false;
+
+    std::vector<int> facePatch(m.faces.size(),-1);
+    std::vector<double> patchArea(patches.size(),0.0);
+    for(int pi=0;pi<(int)patches.size();++pi){
+        for(int f:patches[pi]){facePatch[f]=pi;patchArea[pi]+=t.faceArea[f];}
+    }
+
+    std::map<std::pair<int,int>,PatchAdj> amap;
+    double boundaryLen=0.0,strongLen=0.0; int adjEdgeN=0;
+    for(const auto&kv:t.edges){
+        const auto&e=kv.second; if(e.faces.size()!=2) continue;
+        int f0=e.faces[0],f1=e.faces[1]; if(!cf.count(f0)||!cf.count(f1)) continue;
+        int a=facePatch[f0],b=facePatch[f1]; if(a<0||b<0||a==b) continue;
+        if(a>b) std::swap(a,b);
+        auto key=std::make_pair(a,b); auto&pa=amap[key]; pa.a=a;pa.b=b;pa.edges.push_back(e.key);pa.length+=e.length;pa.meanAngle+=e.dihedralDeg*e.length;
+        boundaryLen+=e.length; if(e.dihedralDeg>=28.0) strongLen+=e.length; adjEdgeN++;
+    }
+    if(amap.size()<patches.size()-1 || boundaryLen<=1e-12) return false;
+
+    // Reject smooth revolved meshes (cylinders/tori): their patch boundaries are mostly shallow.
+    const double strongFrac=strongLen/boundaryLen;
+    if(strongFrac < 0.72) return false;
+
+    std::vector<PatchAdj> adjs; adjs.reserve(amap.size());
+    for(auto&kv:amap){auto a=kv.second;if(a.length>0)a.meanAngle/=a.length;adjs.push_back(std::move(a));}
+
+    // Maximum-weight spanning tree = boundaries to KEEP welded. Long shared boundaries are
+    // preferred, and broad panels are kept attached before tiny chamfer fragments.
+    struct DSU{std::vector<int>p,r;DSU(int n):p(n),r(n,0){for(int i=0;i<n;i++)p[i]=i;}int F(int x){return p[x]==x?x:p[x]=F(p[x]);}bool U(int a,int b){a=F(a);b=F(b);if(a==b)return false;if(r[a]<r[b])std::swap(a,b);p[b]=a;if(r[a]==r[b])r[a]++;return true;}};
+    std::vector<int> order(adjs.size()); for(int i=0;i<(int)order.size();++i)order[i]=i;
+    std::sort(order.begin(),order.end(),[&](int ia,int ib){
+        const auto&A=adjs[ia];const auto&B=adjs[ib];
+        double wa=A.length*(1.0+0.18*std::log1p(std::min(patchArea[A.a],patchArea[A.b])/std::max(1e-12,t.avgEdge*t.avgEdge)));
+        double wb=B.length*(1.0+0.18*std::log1p(std::min(patchArea[B.a],patchArea[B.b])/std::max(1e-12,t.avgEdge*t.avgEdge)));
+        return wa>wb;
+    });
+    DSU dsu((int)patches.size()); std::set<std::pair<int,int>> keep; int kept=0;
+    for(int oi:order){const auto&a=adjs[oi];if(dsu.U(a.a,a.b)){keep.insert({a.a,a.b});if(++kept==(int)patches.size()-1)break;}}
+    if(kept!=(int)patches.size()-1) return false;
+
+    cuts.clear();
+    for(const auto&a:adjs){if(!keep.count({a.a,a.b}))for(const auto&e:a.edges){auto it=t.edges.find(e);if(it!=t.edges.end()&&!it->second.openBoundary)cuts.insert(e);}}
+    // Sanity: a closed P-patch shell needs roughly (all adjacencies - (P-1)) cut boundaries.
+    return !cuts.empty();
+}
+
+static bool jacobiSmallestEigenVector(const double Ain[3][3],Vec3&out){
+    double a[3][3]; for(int i=0;i<3;i++)for(int j=0;j<3;j++)a[i][j]=Ain[i][j];
+    double v[3][3]={{1,0,0},{0,1,0},{0,0,1}};
+    for(int it=0;it<32;it++){
+        int p=0,q=1;double mx=std::abs(a[0][1]);
+        if(std::abs(a[0][2])>mx){p=0;q=2;mx=std::abs(a[0][2]);}
+        if(std::abs(a[1][2])>mx){p=1;q=2;mx=std::abs(a[1][2]);}
+        if(mx<1e-12)break;
+        double phi=0.5*std::atan2(2*a[p][q],a[q][q]-a[p][p]);double c=std::cos(phi),s=std::sin(phi);
+        for(int k=0;k<3;k++){double apk=a[p][k],aqk=a[q][k];a[p][k]=c*apk-s*aqk;a[q][k]=s*apk+c*aqk;}
+        for(int k=0;k<3;k++){double akp=a[k][p],akq=a[k][q];a[k][p]=c*akp-s*akq;a[k][q]=s*akp+c*akq;}
+        for(int k=0;k<3;k++){double vkp=v[k][p],vkq=v[k][q];v[k][p]=c*vkp-s*vkq;v[k][q]=s*vkp+c*vkq;}
+    }
+    int mi=0;if(a[1][1]<a[mi][mi])mi=1;if(a[2][2]<a[mi][mi])mi=2;out=norm({v[0][mi],v[1][mi],v[2][mi]});return len2(out)>1e-12;
+}
+
+static bool componentEulerGenusOne(const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp){
+    std::unordered_set<int>fs(comp.begin(),comp.end()),vs;std::set<EdgeKey>es;bool open=false;
+    for(int f:comp){for(const auto&c:m.faces[f].c)vs.insert(c.v);}
+    for(const auto&kv:t.edges){const auto&e=kv.second;int n=0;for(int f:e.faces)if(fs.count(f))n++;if(n){es.insert(e.key);if(n==1)open=true;}}
+    if(open)return false; long long chi=(long long)vs.size()-(long long)es.size()+(long long)comp.size(); return chi==0;
+}
+
+static bool pickDirectionalClosedLoop(const ObjMesh&m,const MeshTopo&t,const std::unordered_set<int>&cf,const Vec3&axis,bool wantMajor,std::vector<EdgeKey>&best){
+    std::set<EdgeKey>cand; Vec3 c{};std::unordered_set<int>vs;
+    for(int f:cf)for(const auto&co:m.faces[f].c)vs.insert(co.v);for(int v:vs)c=c+m.vertices[v-1];if(!vs.empty())c=c/(double)vs.size();
+    for(const auto&kv:t.edges){const auto&e=kv.second;if(e.faces.size()!=2||!cf.count(e.faces[0])||!cf.count(e.faces[1]))continue;
+        Vec3 mid=(m.vertices[e.key.a-1]+m.vertices[e.key.b-1])*0.5;Vec3 rel=mid-c;Vec3 radial=rel-axis*dot(rel,axis);double rl=len(radial);if(rl<1e-9)continue;radial=radial/rl;Vec3 tang=norm(cross(axis,radial));Vec3 d=norm(m.vertices[e.key.b-1]-m.vertices[e.key.a-1]);double maj=std::abs(dot(d,tang));double minr=std::sqrt(std::max(0.0,1.0-maj*maj));
+        double score=wantMajor?maj:minr;double other=wantMajor?minr:maj;if(score>0.82 && score>other*1.35)cand.insert(e.key);
+    }
+    if(cand.empty())return false;auto cs=edgeConnectedComponents(cand);double bestLen=std::numeric_limits<double>::infinity();
+    for(auto&ec:cs){if(!looksLikeClosedLoop(ec))continue;double L=loopLength(t,ec);if(L<bestLen){bestLen=L;best=ec;}}
+    return !best.empty();
+}
+
+static bool tryTorusIdealAssist(const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,std::set<EdgeKey>&cuts){
+    if(comp.size()<24||!componentEulerGenusOne(m,t,comp))return false;
+    // Torus assist is for smooth genus-1 components only.
+    std::unordered_set<int>cf(comp.begin(),comp.end());double sharp=0,total=0;
+    for(const auto&kv:t.edges){const auto&e=kv.second;if(e.faces.size()==2&&cf.count(e.faces[0])&&cf.count(e.faces[1])){total+=e.length;if(e.dihedralDeg>35.0)sharp+=e.length;}}
+    if(total<=0||sharp/total>0.70)return false;
+    Vec3 ctr{};std::unordered_set<int>vs;for(int f:comp)for(const auto&co:m.faces[f].c)vs.insert(co.v);for(int v:vs)ctr=ctr+m.vertices[v-1];ctr=ctr/(double)vs.size();
+    double C[3][3]={{0}};for(int v:vs){Vec3 d=m.vertices[v-1]-ctr;double q[3]={d.x,d.y,d.z};for(int i=0;i<3;i++)for(int j=0;j<3;j++)C[i][j]+=q[i]*q[j];}
+    Vec3 axis;if(!jacobiSmallestEigenVector(C,axis))return false;
+    std::vector<EdgeKey>minorLoop,majorLoop;if(!pickDirectionalClosedLoop(m,t,cf,axis,false,minorLoop))return false;if(!pickDirectionalClosedLoop(m,t,cf,axis,true,majorLoop))return false;
+    cuts.clear();for(auto&e:minorLoop)cuts.insert(e);for(auto&e:majorLoop)cuts.insert(e);return cuts.size()>=6;
 }
 
 static std::set<EdgeKey> planarBoundaryLoops(const ObjMesh&m,const MeshTopo&t,const std::unordered_set<int>&compFaces,const Profile&p){
@@ -423,8 +548,10 @@ static std::set<EdgeKey> planFeatureAwareLegacy(const ObjMesh&m,const MeshTopo&t
 
 static std::set<EdgeKey> planFeatureAware(const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,const Profile&p){
     std::set<EdgeKey> structured;
-    if(tryAxialStandardAssist(m,t,comp,p,structured)){
-        // Same boundary rule as V2: true mesh openings are already free and should not be emitted.
+    // Order matters: genus-1 smooth surfaces first; then hard-surface nets; then axial tube/cylinder patterns.
+    if(tryTorusIdealAssist(m,t,comp,structured) ||
+       tryHardSurfaceIdealNet(m,t,comp,p,structured) ||
+       tryAxialStandardAssist(m,t,comp,p,structured)){
         for(auto it=structured.begin();it!=structured.end();){auto ei=t.edges.find(*it);if(ei!=t.edges.end()&&ei->second.openBoundary)it=structured.erase(it);else ++it;}
         return structured;
     }
@@ -435,7 +562,7 @@ static double parseBound(const std::string&s){try{return std::stod(s);}catch(...
 
 int main(int argc,char**argv){
     if(argc<4){
-        std::cerr<<"RotateUV Native Auto Seam V2.2 - Feature-Aware + Standard Geometry Assist (V2.1 behavior frozen)\nUsage: RotateUV_AutoSeam.exe input.obj output.seams profileBound [legacyInitialCut]\n";return 2;
+        std::cerr<<"RotateUV Native Auto Seam V2.3 - Ideal Standard Geometry + Feature-Aware fallback\nUsage: RotateUV_AutoSeam.exe input.obj output.seams profileBound [legacyInitialCut]\n";return 2;
     }
     fs::path inputPath=fs::absolute(argv[1]);fs::path outputPath=fs::absolute(argv[2]);double bound=parseBound(argv[3]);Profile prof=profileFromBound(bound);
     ObjMesh mesh;std::string err;if(!readTriObj(inputPath,mesh,err)){std::cerr<<err<<"\n";return 4;}MeshTopo topo=buildTopo(mesh);auto comps=faceComponents(mesh);
@@ -449,6 +576,6 @@ int main(int argc,char**argv){
     out<<"SEAMS "<<allCuts.size()<<"\n";
     for(auto&e:allCuts)out<<"SEAM "<<e.a<<" "<<e.b<<"\n";
     out<<"END\n";out.close();
-    std::cout<<"RotateUV Feature-Aware Auto Seam V2.2: "<<allCuts.size()<<" seam edges | "<<prof.name<<" | components="<<comps.size()<<"\n";
+    std::cout<<"RotateUV Ideal Auto Seam V2.3: "<<allCuts.size()<<" seam edges | "<<prof.name<<" | components="<<comps.size()<<"\n";
     return 0;
 }

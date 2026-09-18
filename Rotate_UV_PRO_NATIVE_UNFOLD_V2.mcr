@@ -130,7 +130,7 @@ fn RotateUV_Open =
         button btn_seamAnalyze "" pos:[14,292] width:34 height:29 iconName:@"EditUVW\FlattenByPolygonAngle" iconSize:[22,22] tooltip:"Generate Native Auto Seam - Feature-Aware planner detects structural loops, caps, transitions and controlled longitudinal openings. This only prepares a seam proposal."
         button btn_seamPreview "" pos:[54,292] width:34 height:29 iconName:@"EditUVW\EditSeams" iconSize:[22,22] tooltip:"Preview Native Auto Seam - selects the proposed internal seam edges on the current Max mesh. Open mesh borders are not proposed."
         button btn_seamApply "" pos:[94,292] width:34 height:29 iconName:@"EditUVW\ConvertEdgeToSeams" iconSize:[22,22] tooltip:"Apply Native Auto Seam - converts the previewed edge selection to Peel/Pelt seams. Existing seams are preserved."
-        dropdownlist ddl_autoSeamProfile "" pos:[136,295] width:152 height:21 items:#("Minimal Seams","Balanced","Low Distortion") selection:2 tooltip:"Feature-Aware seam profile. Minimal Seams uses stronger feature thresholds; Low Distortion accepts more structural cuts."
+        dropdownlist ddl_autoSeamProfile "" pos:[136,295] width:152 height:21 items:#("Minimal Seams","Balanced","Low Distortion","Ideal Standard") selection:4 tooltip:"Ideal Standard: topology-first seams for Box, ChamferBox, Cylinder/Tube and Torus, with Feature-Aware fallback for arbitrary meshes."
 
         -- Row 2: solve and finishing tools.
         button btn_unfold "" pos:[18,329] width:34 height:31 iconName:@"EditUVW\QuickPeel" iconSize:[23,23] tooltip:"Native Unfold V2 - libigl LSCM initialization + SLIM symmetric-Dirichlet optimization for seam-constrained shells. Requires applied Peel/Pelt seams. Falls back to 3ds Max Unfold3D if the native worker is unavailable."
@@ -4767,7 +4767,8 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                 1: 7.0
                 2: 5.5
                 3: 4.25
-                default: 5.5
+                4: 3.5
+                default: 3.5
             )
         )
 
@@ -4778,7 +4779,8 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                 1: "Minimal Seams"
                 2: "Balanced"
                 3: "Low Distortion"
-                default: "Balanced"
+                4: "Ideal Standard"
+                default: "Ideal Standard"
             )
         )
 
