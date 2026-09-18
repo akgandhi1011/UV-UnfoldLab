@@ -1,21 +1,33 @@
-# RotateUV Native Unfold V2.4
+# RotateUV Native Unfold V2.5 FINAL
 
-## V2.4 changes
+## Final seam strategy
 
-- `Ideal Standard` is no longer a separate profile. Standard-geometry recognition is embedded in **Minimal Seams**.
-- **Minimal Seams** is now the default profile.
-- 3ds Max **Tube** is distinguished from a smooth torus even though both are genus-1 topologies. Sharp axial Tube geometry is handled before torus recognition.
-- Tube output targets clean structural loops plus controlled openings instead of selecting nearly every edge.
-- Smooth torus recognition is stricter, preventing sharp Tube primitives from entering the torus path.
-- ChamferBox/hard-surface nets now reject clearly under-cut 2-3 edge results and fall through to a more appropriate structured/fallback solution.
-- Standard Box behavior is preserved.
+**Minimal Seams** is the default and no separate "Ideal Standard" profile is exposed.
+
+The auto-seam planner now works in this order:
+
+1. **Round Cylinder / Tube** - detects circular axial stations, creates only structural cap/wall separator loops, then adds controlled longitudinal and radial openings. Rounded rectangular ChamferBoxes are explicitly prevented from entering this path.
+2. **Smooth Torus** - uses one meridian cycle plus one longitude cycle.
+3. **Topology-aware hard-surface net** - collapses coplanar triangles into logical surface patches, builds the patch adjacency graph, then keeps a maximum-quality spanning tree as hinges. Only the remaining cycle-breaking patch boundaries are cut. Smooth bevel/chamfer transitions are preferred as hinges, while sharper corners are preferred seam locations. This applies to Box, ChamferBox, furniture, bridge panels, machinery and similar Editable Poly hard-surface models without relying on primitive names.
+4. **Feature-aware fallback** - retained for freeform meshes that do not confidently match the structured paths.
+
+Native Unfold remains **libigl LSCM + SLIM** after seams are applied.
 
 ### Profiles
 
-1. Minimal Seams (default; includes automatic Box / ChamferBox / Cylinder / Tube / Torus recognition)
+1. Minimal Seams (default, topology-aware)
 2. Balanced
 3. Low Distortion
 
+### Expected seam behavior
+
+- Box: connected box-net style shell.
+- ChamferBox: connected panel/bevel net; avoids the old 2-3-edge under-cut and avoids treating the rounded rectangle as a Tube.
+- Cylinder: cap separator + one wall opening.
+- Hollow Tube: outer/inner structural loops plus controlled wall and annular-cap openings, not repeated random rings.
+- Torus: two fundamental opening cycles.
+- General hard-surface objects: large coherent surface groups remain connected wherever possible.
+
 ### Build
 
-Use the included `.github/workflows/build-windows.yml` workflow. The repository contains the MaxScript UI, auto-seam worker and native unfold worker.
+Use `.github/workflows/build-windows.yml`. The workflow builds the Auto Seam worker and the libigl Native Unfold worker and uploads a Windows artifact.

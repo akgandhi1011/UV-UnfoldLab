@@ -127,10 +127,10 @@ fn RotateUV_Open =
         groupBox grp_unfold "SEAM / UNFOLD / STRAIGHTEN" pos:[6,278] width:292 height:91
 
         -- Row 1: native seam optimization. Generate never changes the Max mesh/UV topology.
-        button btn_seamAnalyze "" pos:[14,292] width:34 height:29 iconName:@"EditUVW\FlattenByPolygonAngle" iconSize:[22,22] tooltip:"Generate Native Auto Seam - Feature-Aware planner detects structural loops, caps, transitions and controlled longitudinal openings. This only prepares a seam proposal."
+        button btn_seamAnalyze "" pos:[14,292] width:34 height:29 iconName:@"EditUVW\FlattenByPolygonAngle" iconSize:[22,22] tooltip:"Generate Auto Seam V2.5 FINAL - Minimal Seams automatically uses topology-aware patch nets for boxes, ChamferBoxes and hard-surface models; round Tube/Cylinder and Torus use dedicated clean openings. Proposal only."
         button btn_seamPreview "" pos:[54,292] width:34 height:29 iconName:@"EditUVW\EditSeams" iconSize:[22,22] tooltip:"Preview Native Auto Seam - selects the proposed internal seam edges on the current Max mesh. Open mesh borders are not proposed."
         button btn_seamApply "" pos:[94,292] width:34 height:29 iconName:@"EditUVW\ConvertEdgeToSeams" iconSize:[22,22] tooltip:"Apply Native Auto Seam - converts the previewed edge selection to Peel/Pelt seams. Existing seams are preserved."
-        dropdownlist ddl_autoSeamProfile "" pos:[136,295] width:152 height:21 items:#("Minimal Seams","Balanced","Low Distortion") selection:1 tooltip:"Minimal Seams automatically uses ideal standard-geometry seams for Box, ChamferBox, Cylinder/Tube and Torus when confidently detected, with feature-aware fallback for arbitrary meshes."
+        dropdownlist ddl_autoSeamProfile "" pos:[136,295] width:152 height:21 items:#("Minimal Seams","Balanced","Low Distortion") selection:1 tooltip:"Minimal Seams is topology-aware: connected patch nets for hard-surface geometry, clean Tube/Cylinder openings, Torus two-cycle opening, and feature-aware fallback for freeform meshes."
 
         -- Row 2: solve and finishing tools.
         button btn_unfold "" pos:[18,329] width:34 height:31 iconName:@"EditUVW\QuickPeel" iconSize:[23,23] tooltip:"Native Unfold V2 - libigl LSCM initialization + SLIM symmetric-Dirichlet optimization for seam-constrained shells. Requires applied Peel/Pelt seams. Falls back to 3ds Max Unfold3D if the native worker is unavailable."
@@ -5890,15 +5890,15 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                 "Padding                      UV-space gap between arranged shells\n" +
                 "Rotate presets               +/-45, +/-90 and 180 degrees\n" +
                 "Custom Angle                 CW / CCW rotation\n" +
-                "Generate Auto Seam            Native feature-aware structural seam planning\n" +
+                "Generate Auto Seam            Minimal Seams with automatic standard-geometry recognition\n" +
                 "Auto Seam Preview             Select proposed internal seam edges\n" +
                 "Auto Seam Apply               Convert proposal to Peel/Pelt seams\n" +
                 "Unfold icon                   Native LSCM solve from explicit seams\n" +
                 "Optimize icon                 Gentle Unfold3D Optimize\n" +
                 "Straighten UV icon            Rectangularize selected quad-grid UV patches\n" +
                 "Straighten Shell icon         Rectangularize complete selected quad-grid shells\n\n" +
-                "NATIVE AUTO SEAM V2 - FEATURE-AWARE\n" +
-                "Workflow: Generate -> Preview -> Apply -> Native Unfold. Auto Seam remains V2.1 and Native Unfold V2 replaces the custom relaxation solver with libigl LSCM initialization plus SLIM symmetric-Dirichlet optimization; seam generation remains V2.1/2.2-compatible and unchanged for general models. The native seam worker analyzes geometry directly: open boundaries are treated as free, structural/cap transition loops are detected from topology and dihedral flow, and tube/strip regions receive controlled longitudinal openings. It returns only internal geometry-edge pairs; true open mesh boundaries are never proposed as seams. Generate/Preview do not alter the Max model. Minimal Seams uses stronger feature thresholds; Low Distortion accepts more structural cuts.\n\n" +
+                "NATIVE AUTO SEAM V2.5 FINAL - TOPOLOGY-AWARE MINIMAL SEAMS\n" +
+                "Workflow: Generate -> Preview -> Apply -> Native Unfold. Minimal Seams now analyzes logical surface patches and builds a maximum-quality spanning-tree of hinges, so large hard-surface areas stay connected and only cycle-breaking boundaries become seams. This is the default for Box, ChamferBox, furniture, bridge panels and similar converted Editable Poly geometry. Round Cylinder/Tube geometry uses structural cap loops plus controlled longitudinal/radial openings; smooth Torus geometry uses one meridian plus one longitude cycle. Freeform geometry falls back to the feature-aware planner. Native Unfold uses libigl LSCM + SLIM. True open mesh boundaries are never proposed as seams.\n\n" +
                 "STRAIGHTEN\n" +
                 "Straighten UV detects clean rectangular quad-grid topology, finds four logical borders, then rebuilds a straight U/V grid using 3D-proportional spacing while preserving UV area and center. Straighten Shell applies the same solver to complete selected shells. Non-grid topology is skipped unchanged.\n\n" +
                 "ROTATION CENTER\n" +

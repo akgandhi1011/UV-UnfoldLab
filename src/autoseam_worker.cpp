@@ -203,6 +203,15 @@ static double loopLength(const MeshTopo&t,const std::vector<EdgeKey>&es){
     double L=0.0; for(const auto&e:es){auto it=t.edges.find(e);if(it!=t.edges.end())L+=it->second.length;} return L;
 }
 
+static double loopEdgeLengthCV(const MeshTopo&t,const std::vector<EdgeKey>&es){
+    if(es.size()<4) return 1.0;
+    double mean=0.0; std::vector<double> ls; ls.reserve(es.size());
+    for(const auto&e:es){auto it=t.edges.find(e);if(it!=t.edges.end()){ls.push_back(it->second.length);mean+=it->second.length;}}
+    if(ls.empty()) return 1.0; mean/=ls.size(); if(mean<1e-12) return 1.0;
+    double v=0.0; for(double x:ls){double d=x-mean;v+=d*d;} v/=ls.size();
+    return std::sqrt(v)/mean;
+}
+
 static std::vector<PlanarLoopCandidate> collectPlanarLoopCandidates(
     const ObjMesh&m,const MeshTopo&t,const std::unordered_set<int>&compFaces,const Profile&p)
 {
@@ -285,6 +294,16 @@ static bool tryAxialStandardAssist(
     }
     if(bestSeed<0||bestFamily.size()<2)return false;
 
+    // Axial standard recognition is reserved for genuinely round Tube/Cylinder-style
+    // stations. Rounded rectangles and ChamferBoxes also have parallel end loops, but
+    // their long/short perimeter edges have a much larger length variation and must go
+    // through the topology-aware patch-net planner instead.
+    bool roundStation=false;
+    for(int idx:bestFamily){
+        if(loops[idx].edges.size()>=8 && loopEdgeLengthCV(t,loops[idx].edges)<=0.22){roundStation=true;break;}
+    }
+    if(!roundStation)return false;
+
     Vec3 axis=norm(loops[bestSeed].normal);Vec3 meanC{};
     for(int idx:bestFamily){if(dot(loops[idx].normal,axis)<0){} meanC=meanC+loops[idx].center;}
     meanC=meanC/(double)bestFamily.size();
@@ -331,7 +350,7 @@ static bool tryAxialStandardAssist(
 
 
 
-// V2.4 automatic Standard Geometry helpers -------------------------------------------------
+// V2.5 FINAL topology-aware Standard Geometry helpers -------------------------------------------------
 // High-confidence topology-first patterns are attempted before the generic planner:
 //   * Box / chamfer-box / extruded hard-surface solids -> one connected patch net.
 //   * Cylinder / hollow tube -> cap separator loops + one opening per resulting band.
@@ -345,13 +364,39 @@ struct PatchAdj {
     double meanAngle=0.0;
 };
 
+static double componentFlatLengthFraction(const MeshTopo&t,const std::vector<int>&comp,double angleDeg=1.25){
+    std::unordered_set<int>cf(comp.begin(),comp.end()); double flat=0.0,total=0.0;
+    for(const auto&kv:t.edges){const auto&e=kv.second;if(e.faces.size()==2&&cf.count(e.faces[0])&&cf.count(e.faces[1])){
+        total+=e.length;if(e.dihedralDeg<=angleDeg)flat+=e.length;
+    }}
+    return total>1e-12?flat/total:0.0;
+}
+
+// Maya-style topology-aware hard-surface net.
+// 1) Collapse triangulation/coplanar faces into logical surface patches.
+// 2) Build the dual adjacency graph of those patches.
+// 3) Keep a maximum-quality spanning tree as hinges.
+// 4) Cut only the remaining patch boundaries, producing one coherent low-cut net.
+// Smooth/rounded patch boundaries are deliberately preferred as hinges; sharper corners
+// are preferred seam locations. This makes bevel/chamfer bands stay attached instead of
+// being shredded into separate strips.
 static bool tryHardSurfaceIdealNet(
     const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,const Profile&p,std::set<EdgeKey>&cuts)
 {
     std::unordered_set<int> cf(comp.begin(),comp.end());
-    auto patches=planarPatches(m,t,cf,p);
-    // A standard hard-surface primitive should collapse to a modest number of planar regions.
-    if(patches.size()<4 || patches.size()>64) return false;
+
+    // Hard-surface meshes made from boxes, chamfered boxes, furniture, bridge panels,
+    // machinery etc. normally contain a meaningful amount of truly coplanar internal
+    // triangulation. This gate keeps smooth spheres/freeform meshes out of the patch-net path.
+    const double flatFrac=componentFlatLengthFraction(t,comp,1.25);
+    if(flatFrac < 0.14) return false;
+
+    Profile pp=p;
+    // Patch formation should only absorb genuinely coplanar triangles. Curved bevel strips
+    // remain as a sequence of patches so the graph can choose which borders are hinges.
+    pp.planarAngle=std::min(2.0,std::max(0.75,p.planarAngle*0.30));
+    auto patches=planarPatches(m,t,cf,pp);
+    if(patches.size()<4 || patches.size()>320) return false;
 
     std::vector<int> facePatch(m.faces.size(),-1);
     std::vector<double> patchArea(patches.size(),0.0);
@@ -360,45 +405,53 @@ static bool tryHardSurfaceIdealNet(
     }
 
     std::map<std::pair<int,int>,PatchAdj> amap;
-    double boundaryLen=0.0,strongLen=0.0; int adjEdgeN=0;
     for(const auto&kv:t.edges){
         const auto&e=kv.second; if(e.faces.size()!=2) continue;
         int f0=e.faces[0],f1=e.faces[1]; if(!cf.count(f0)||!cf.count(f1)) continue;
         int a=facePatch[f0],b=facePatch[f1]; if(a<0||b<0||a==b) continue;
         if(a>b) std::swap(a,b);
-        auto key=std::make_pair(a,b); auto&pa=amap[key]; pa.a=a;pa.b=b;pa.edges.push_back(e.key);pa.length+=e.length;pa.meanAngle+=e.dihedralDeg*e.length;
-        boundaryLen+=e.length; if(e.dihedralDeg>=28.0) strongLen+=e.length; adjEdgeN++;
+        auto key=std::make_pair(a,b); auto&pa=amap[key]; pa.a=a;pa.b=b;pa.edges.push_back(e.key);
+        pa.length+=e.length;pa.meanAngle+=e.dihedralDeg*e.length;
     }
-    if(amap.size()<patches.size()-1 || boundaryLen<=1e-12) return false;
-
-    // Reject smooth revolved meshes (cylinders/tori): their patch boundaries are mostly shallow.
-    const double strongFrac=strongLen/boundaryLen;
-    if(strongFrac < 0.72) return false;
+    if(amap.size()<patches.size()-1) return false;
 
     std::vector<PatchAdj> adjs; adjs.reserve(amap.size());
     for(auto&kv:amap){auto a=kv.second;if(a.length>0)a.meanAngle/=a.length;adjs.push_back(std::move(a));}
 
-    // Maximum-weight spanning tree = boundaries to KEEP welded. Long shared boundaries are
-    // preferred, and broad panels are kept attached before tiny chamfer fragments.
     struct DSU{std::vector<int>p,r;DSU(int n):p(n),r(n,0){for(int i=0;i<n;i++)p[i]=i;}int F(int x){return p[x]==x?x:p[x]=F(p[x]);}bool U(int a,int b){a=F(a);b=F(b);if(a==b)return false;if(r[a]<r[b])std::swap(a,b);p[b]=a;if(r[a]==r[b])r[a]++;return true;}};
     std::vector<int> order(adjs.size()); for(int i=0;i<(int)order.size();++i)order[i]=i;
     std::sort(order.begin(),order.end(),[&](int ia,int ib){
         const auto&A=adjs[ia];const auto&B=adjs[ib];
-        double wa=A.length*(1.0+0.18*std::log1p(std::min(patchArea[A.a],patchArea[A.b])/std::max(1e-12,t.avgEdge*t.avgEdge)));
-        double wb=B.length*(1.0+0.18*std::log1p(std::min(patchArea[B.a],patchArea[B.b])/std::max(1e-12,t.avgEdge*t.avgEdge)));
-        return wa>wb;
+        auto hingeScore=[&](const PatchAdj&x){
+            double smallArea=std::min(patchArea[x.a],patchArea[x.b]);
+            double areaScale=1.0+0.16*std::log1p(smallArea/std::max(1e-12,t.avgEdge*t.avgEdge));
+            // Smooth transitions are valuable hinges. 90-degree corners remain viable, but
+            // lose ties against chamfer/bevel continuity of similar length.
+            double smoothBonus=1.0+1.35*std::exp(-x.meanAngle/18.0);
+            double verySharpPenalty=1.0/(1.0+0.22*std::max(0.0,(x.meanAngle-70.0)/20.0));
+            return x.length*areaScale*smoothBonus*verySharpPenalty;
+        };
+        return hingeScore(A)>hingeScore(B);
     });
+
     DSU dsu((int)patches.size()); std::set<std::pair<int,int>> keep; int kept=0;
     for(int oi:order){const auto&a=adjs[oi];if(dsu.U(a.a,a.b)){keep.insert({a.a,a.b});if(++kept==(int)patches.size()-1)break;}}
     if(kept!=(int)patches.size()-1) return false;
 
     cuts.clear();
-    for(const auto&a:adjs){if(!keep.count({a.a,a.b}))for(const auto&e:a.edges){auto it=t.edges.find(e);if(it!=t.edges.end()&&!it->second.openBoundary)cuts.insert(e);}}
-    // Sanity: a closed hard-surface shell with many planar/chamfer patches cannot be
-    // represented by only a tiny slit. Reject under-cut results so another recognizer
-    // can take over rather than returning the 2-3 edge failure seen on ChamferBox.
-    const size_t minUsefulCuts = patches.size()<=8 ? 4u : std::max<size_t>(6u, patches.size()/3u);
-    return cuts.size()>=minUsefulCuts;
+    for(const auto&a:adjs){
+        if(!keep.count({a.a,a.b})) for(const auto&e:a.edges){
+            auto it=t.edges.find(e);if(it!=t.edges.end()&&!it->second.openBoundary)cuts.insert(e);
+        }
+    }
+
+    // Closed hard-surface objects need a real opening, not a token 2-3 edge slit.
+    // The cycle rank of the patch graph tells us whether a meaningful net was created.
+    const size_t cycleRank = adjs.size()>=patches.size() ? adjs.size()-patches.size()+1 : 0;
+    if(cycleRank==0 || cuts.size()<std::min<size_t>(4,std::max<size_t>(1,patches.size()/8))) return false;
+
+    pruneTinyBranches(t,p,cuts);
+    return !cuts.empty();
 }
 
 static bool jacobiSmallestEigenVector(const double Ain[3][3],Vec3&out){
@@ -560,18 +613,14 @@ static std::set<EdgeKey> planFeatureAware(const ObjMesh&m,const MeshTopo&t,const
     const bool genusOne=componentEulerGenusOne(m,t,comp);
     const double sharpFrac=componentSharpLengthFraction(t,comp,35.0);
 
-    // Recognition is automatic inside every profile (especially Minimal Seams).
-    // A Max Tube and a torus are both genus-1. Distinguish them by structural creases:
-    // Tube -> axial cap/wall loops first; smooth torus -> meridian + longitude.
+    // V2.5 strategy: geometry-aware when confidence is high, topology-aware otherwise.
+    // Round axial parts are handled first; a smooth torus uses its two fundamental cycles;
+    // hard-surface objects use the generic patch adjacency spanning-tree net. Primitive names
+    // are never required, so converted Editable Poly objects still receive the same treatment.
     bool matched=false;
-    if(genusOne && sharpFrac>0.18) matched=tryAxialStandardAssist(m,t,comp,p,structured);
+    if(sharpFrac>0.10) matched=tryAxialStandardAssist(m,t,comp,p,structured);
     if(!matched && genusOne) matched=tryTorusIdealAssist(m,t,comp,structured);
-
-    // Genus-0 box/chamfer-box: preserve the proven box net first. Chamfered/extruded
-    // shapes get a coherent patch net; if that is under-cut, axial recognition gets
-    // a chance before generic feature-aware fallback.
     if(!matched) matched=tryHardSurfaceIdealNet(m,t,comp,p,structured);
-    if(!matched) matched=tryAxialStandardAssist(m,t,comp,p,structured);
 
     if(matched){
         for(auto it=structured.begin();it!=structured.end();){auto ei=t.edges.find(*it);if(ei!=t.edges.end()&&ei->second.openBoundary)it=structured.erase(it);else ++it;}
@@ -584,7 +633,7 @@ static double parseBound(const std::string&s){try{return std::stod(s);}catch(...
 
 int main(int argc,char**argv){
     if(argc<4){
-        std::cerr<<"RotateUV Native Auto Seam V2.4 - Minimal Seams + automatic Standard Geometry recognition\nUsage: RotateUV_AutoSeam.exe input.obj output.seams profileBound [legacyInitialCut]\n";return 2;
+        std::cerr<<"RotateUV Native Auto Seam V2.5 FINAL - topology-aware Minimal Seams\nUsage: RotateUV_AutoSeam.exe input.obj output.seams profileBound [legacyInitialCut]\n";return 2;
     }
     fs::path inputPath=fs::absolute(argv[1]);fs::path outputPath=fs::absolute(argv[2]);double bound=parseBound(argv[3]);Profile prof=profileFromBound(bound);
     ObjMesh mesh;std::string err;if(!readTriObj(inputPath,mesh,err)){std::cerr<<err<<"\n";return 4;}MeshTopo topo=buildTopo(mesh);auto comps=faceComponents(mesh);
@@ -598,6 +647,6 @@ int main(int argc,char**argv){
     out<<"SEAMS "<<allCuts.size()<<"\n";
     for(auto&e:allCuts)out<<"SEAM "<<e.a<<" "<<e.b<<"\n";
     out<<"END\n";out.close();
-    std::cout<<"RotateUV Native Auto Seam V2.4: "<<allCuts.size()<<" seam edges | "<<prof.name<<" | components="<<comps.size()<<"\n";
+    std::cout<<"RotateUV Native Auto Seam V2.5 FINAL: "<<allCuts.size()<<" seam edges | "<<prof.name<<" | components="<<comps.size()<<"\n";
     return 0;
 }
