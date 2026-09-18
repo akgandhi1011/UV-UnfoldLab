@@ -15,7 +15,7 @@
     - No blind Angle Snap toggle on older versions
     - Independent island rotation
     - Automatic rotation centers: island center for Auto, edge center for Manual
-    - Topology + Edge-Flow Atlas V8: swept strips, cap loops, structural rails + V7.2 fallback
+    - Single native Professional Minimal-Seam planner; no competing legacy seam engine
     - Unfold3D uses explicit Peel seams; no seam = no destructive solve
     - Pro quad-grid Straighten UV / Straighten Shell
     - Rotation presets and custom angle
@@ -74,19 +74,11 @@ fn RotateUV_Open =
         local capturedSelectionData = undefined
         local capturedMode = 1
         local isBusy = false
-        -- Quality metrics reported by the Native Unfold worker (RUVUV 2+).
-        local nativeUnfoldLastStretch = 0.0
-        local nativeUnfoldLastMeanStretch = 0.0
-        local nativeUnfoldLastOverlaps = 0
         local seamSuggestedUVEdges = #{}
         local seamAnalysisValid = false
         local seamAnalysisNode = undefined
         local seamAnalysisFaceCount = 0
         local seamTargetFaces = #{}
-        local seamTubeCount = 0
-        local seamManualCount = 0
-        local atlasChartCount = 0
-        local atlasWorstEnergy = 0.0
 
         ----------------------------------------------------------------------
         -- UI - extra compact Pro layout
@@ -131,10 +123,10 @@ fn RotateUV_Open =
         groupBox grp_unfold "SEAM / UNFOLD / STRAIGHTEN" pos:[6,278] width:292 height:91
 
         -- Row 1: native seam optimization. Generate never changes the Max mesh/UV topology.
-        button btn_seamAnalyze "" pos:[14,292] width:34 height:29 iconName:@"EditUVW\FlattenByPolygonAngle" iconSize:[22,22] tooltip:"Generate Auto Seam V2.5 FINAL - Minimal Seams automatically uses topology-aware patch nets for boxes, ChamferBoxes and hard-surface models; round Tube/Cylinder and Torus use dedicated clean openings. Proposal only."
+        button btn_seamAnalyze "" pos:[14,292] width:34 height:29 iconName:@"EditUVW\FlattenByPolygonAngle" iconSize:[22,22] tooltip:"Generate Professional Auto Seam - one automatic topology-aware Minimal-Seam policy. No profile selection. Proposal only; the mesh is unchanged until Apply."
         button btn_seamPreview "" pos:[54,292] width:34 height:29 iconName:@"EditUVW\EditSeams" iconSize:[22,22] tooltip:"Preview Native Auto Seam - selects the proposed internal seam edges on the current Max mesh. Open mesh borders are not proposed."
         button btn_seamApply "" pos:[94,292] width:34 height:29 iconName:@"EditUVW\ConvertEdgeToSeams" iconSize:[22,22] tooltip:"Apply Native Auto Seam - converts the previewed edge selection to Peel/Pelt seams. Existing seams are preserved."
-        dropdownlist ddl_autoSeamProfile "" pos:[136,295] width:152 height:21 items:#("Minimal Seams","Balanced","Low Distortion") selection:1 tooltip:"Minimal Seams is topology-aware: connected patch nets for hard-surface geometry, clean Tube/Cylinder openings, Torus two-cycle opening, and feature-aware fallback for freeform meshes."
+        label lbl_autoSeamMode "PRO MINIMAL SEAMS" pos:[139,298] width:145 height:16 align:#center tooltip:"One automatic structural seam mode. No seam-profile dropdown: the planner decides the appropriate cut strategy from topology and shape."
 
         -- Row 2: solve and finishing tools.
         button btn_unfold "" pos:[18,329] width:34 height:31 iconName:@"EditUVW\QuickPeel" iconSize:[23,23] tooltip:"Native Unfold V2 - libigl LSCM initialization + SLIM symmetric-Dirichlet optimization for seam-constrained shells. Requires applied Peel/Pelt seams. Falls back to 3ds Max Unfold3D if the native worker is unavailable."
@@ -2627,70 +2619,9 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
         )
 
         ----------------------------------------------------------------------
-        -- SHAPE-AWARE AUTO SEAM V5
-        --
-        -- Conservative seam proposal only.  It does not modify topology until
-        -- Apply is pressed.
-        --
-        -- 1) Strict coplanar regions describe hard-surface panels.
-        -- 2) A maximum-keep region tree creates a connected, low-cut panel net.
-        -- 3) Smooth components with two dominant disconnected boundary loops are
-        --    treated as tube/pipe strips: hard attachment boundaries are cut and
-        --    one shortest geometry path opens the tube longitudinally.
-        -- 4) Very smooth closed components are left for manual seams instead of
-        --    receiving an arbitrary star/spiral cut.
+        -- Shared seam-pair helpers
+        -- Used by both the native seam worker mapper and Native Unfold.
         ----------------------------------------------------------------------
-        fn seamEdgeRecordCompare a b =
-        (
-            if a[1] < b[1] then -1
-            else if a[1] > b[1] then 1
-            else if a[2] < b[2] then -1
-            else if a[2] > b[2] then 1
-            else if a[3] < b[3] then -1
-            else if a[3] > b[3] then 1
-            else 0
-        )
-
-        -- Pair membership used to be a linear array scan, which made seam
-        -- collection O(seamEdges * faces * corners). These use a .NET Hashtable
-        -- keyed on a single packed integer instead, so lookups are O(1).
-        fn seamPairKey a b =
-        (
-            local lo = if a < b then a else b
-            local hi = if a < b then b else a
-            ((lo as string) + "_" + (hi as string))
-        )
-
-        fn seamNewPairSet =
-        (
-            local ht = undefined
-            try(ht = dotNetObject "System.Collections.Hashtable")catch(ht = undefined)
-            ht
-        )
-
-        fn seamSetHas pairSet a b =
-        (
-            if pairSet == undefined then false
-            else
-            (
-                local ok = false
-                try(ok = pairSet.ContainsKey (seamPairKey a b))catch(ok = false)
-                ok
-            )
-        )
-
-        fn seamSetAdd pairSet a b =
-        (
-            if pairSet != undefined and a > 0 and b > 0 and a != b do
-            (
-                local k = seamPairKey a b
-                try(if not (pairSet.ContainsKey k) do pairSet.Add k true)catch()
-            )
-            pairSet
-        )
-
-        -- Retained for the legacy call sites; both now take the fast path when a
-        -- Hashtable is available and fall back to the array scan if .NET is not.
         fn seamPairExists pair pairArray =
         (
             local found = false
@@ -2713,1762 +2644,16 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
             pairArray
         )
 
-        fn seamGeomEdgeLength g1 g2 geomMesh =
-        (
-            local d = 1.0
-            if geomMesh != undefined do
-            (
-                try
-                (
-                    local nv = getNumVerts geomMesh
-                    if g1 > 0 and g2 > 0 and g1 <= nv and g2 <= nv do
-                    (
-                        local p1 = getVert geomMesh g1
-                        local p2 = getVert geomMesh g2
-                        local dd = distance p1 p2
-                        if dd > 0.00000001 do d = dd
-                    )
-                )
-                catch(d = 1.0)
-            )
-            d
-        )
-
-        ----------------------------------------------------------------------
-        -- TOPOLOGY + EDGE-FLOW ATLAS V8
-        --
-        -- Primary rule:
-        --   TRUE / EFFECTIVE OPEN MESH BOUNDARIES ARE ALREADY CUT.
-        --   They are never proposed as new seams.
-        --
-        -- The analyzer works on arbitrary geometry. It does not classify the
-        -- object as a box, tube, head, ear, statue, etc. For each connected
-        -- surface component it first finds its open boundary components. It
-        -- then adds the minimum useful seam chains:
-        --   * 2+ open boundaries -> connect boundary components with shortest
-        --     low-cost paths (tube/handle/spout naturally gets one lengthwise cut)
-        --   * 0 open boundaries  -> add one conservative diameter slit
-        --   * 1 open boundary    -> already topologically open; only add one
-        --     relief slit when intrinsic curvature indicates it is worthwhile
-        --
-        -- Existing UV seams are treated as almost-free paths and are not
-        -- proposed again. Sharp/folded edges are slightly preferred, but
-        -- curvature never creates whole rings by itself.
-        ----------------------------------------------------------------------
-
-        fn atlasHeapPush heap item =
-        (
-            append heap item
-            local i = heap.count
-            local moving = true
-            while i > 1 and moving do
-            (
-                local p = floor (i / 2.0)
-                if heap[p][1] <= item[1] then
-                    moving = false
-                else
-                (
-                    heap[i] = heap[p]
-                    i = p
-                )
-            )
-            heap[i] = item
-            true
-        )
-
-        fn atlasHeapPop heap =
-        (
-            if heap.count < 1 then undefined
-            else
-            (
-                local root = heap[1]
-                local last = heap[heap.count]
-                deleteItem heap heap.count
-                if heap.count > 0 do
-                (
-                    local i = 1
-                    local moving = true
-                    while moving do
-                    (
-                        local l = i * 2
-                        local r = l + 1
-                        if l > heap.count then
-                            moving = false
-                        else
-                        (
-                            local c = l
-                            if r <= heap.count and heap[r][1] < heap[l][1] do c = r
-                            if heap[c][1] >= last[1] then
-                                moving = false
-                            else
-                            (
-                                heap[i] = heap[c]
-                                i = c
-                            )
-                        )
-                    )
-                    heap[i] = last
-                )
-                root
-            )
-        )
-
-        fn v7DijkstraFromSet sourceVerts vertGraph maxGeomVert =
-        (
-            local inf = 1.0e30
-            local dist = for i = 1 to maxGeomVert collect inf
-            local prevV = for i = 1 to maxGeomVert collect 0
-            local prevG = for i = 1 to maxGeomVert collect 0
-            local heap = #()
-
-            if sourceVerts != undefined do
-            (
-                for sv in sourceVerts do
-                (
-                    if sv > 0 and sv <= maxGeomVert do
-                    (
-                        dist[sv] = 0.0
-                        atlasHeapPush heap #(0.0, sv)
-                    )
-                )
-            )
-
-            while heap.count > 0 do
-            (
-                local item = atlasHeapPop heap
-                if item != undefined do
-                (
-                    local d = item[1]
-                    local v = item[2]
-                    if d <= (dist[v] + 0.0000001) and vertGraph[v] != undefined do
-                    (
-                        for ar in vertGraph[v] do
-                        (
-                            local nv = ar[1]
-                            local gi = ar[2]
-                            local step = ar[3]
-                            local nd = d + step
-                            if nd < (dist[nv] - 0.0000001) do
-                            (
-                                dist[nv] = nd
-                                prevV[nv] = v
-                                prevG[nv] = gi
-                                atlasHeapPush heap #(nd, nv)
-                            )
-                        )
-                    )
-                )
-            )
-            #(dist, prevV, prevG)
-        )
-
-        fn v7PathGroupsToVertex targetV dijkstraData =
-        (
-            local result = #()
-            if dijkstraData == undefined or targetV <= 0 then return result
-            local prevV = dijkstraData[2]
-            local prevG = dijkstraData[3]
-            local v = targetV
-            local safety = 0
-            while v > 0 and v <= prevV.count and prevV[v] != 0 and safety < (prevV.count + 4) do
-            (
-                safety += 1
-                if prevG[v] > 0 do append result prevG[v]
-                v = prevV[v]
-            )
-            result
-        )
-
-        fn v7ShortestPathBetweenSets sourceVerts targetVerts vertGraph maxGeomVert =
-        (
-            if sourceVerts == undefined or targetVerts == undefined or sourceVerts.isEmpty or targetVerts.isEmpty then undefined
-            else
-            (
-                local dj = v7DijkstraFromSet sourceVerts vertGraph maxGeomVert
-                local dist = dj[1]
-                local bestV = 0
-                local bestD = 1.0e30
-                for v in targetVerts do
-                (
-                    if v > 0 and v <= maxGeomVert and dist[v] < bestD do
-                    (
-                        bestD = dist[v]
-                        bestV = v
-                    )
-                )
-                if bestV == 0 or bestD >= 1.0e29 then undefined
-                else #(v7PathGroupsToVertex bestV dj, bestD, bestV)
-            )
-        )
-
-        fn v7FarthestPathFromSet sourceVerts allowedVerts vertGraph maxGeomVert =
-        (
-            if sourceVerts == undefined or sourceVerts.isEmpty or allowedVerts == undefined or allowedVerts.isEmpty then undefined
-            else
-            (
-                local dj = v7DijkstraFromSet sourceVerts vertGraph maxGeomVert
-                local dist = dj[1]
-                local bestV = 0
-                local bestD = -1.0
-                for v in allowedVerts do
-                (
-                    if v > 0 and v <= maxGeomVert and dist[v] < 1.0e29 and dist[v] > bestD do
-                    (
-                        bestD = dist[v]
-                        bestV = v
-                    )
-                )
-                if bestV == 0 then undefined
-                else #(v7PathGroupsToVertex bestV dj, bestD, bestV, dj)
-            )
-        )
-
-        fn v7DiameterPath allowedVerts vertGraph maxGeomVert =
-        (
-            if allowedVerts == undefined or allowedVerts.isEmpty then undefined
-            else
-            (
-                local seed = 0
-                for v in allowedVerts while seed == 0 do seed = v
-                if seed == 0 then undefined
-                else
-                (
-                    local src = #{seed}
-                    local pass1 = v7FarthestPathFromSet src allowedVerts vertGraph maxGeomVert
-                    if pass1 == undefined then undefined
-                    else
-                    (
-                        local a = pass1[3]
-                        local src2 = #{a}
-                        local pass2 = v7FarthestPathFromSet src2 allowedVerts vertGraph maxGeomVert
-                        if pass2 == undefined then undefined else #(pass2[1], pass2[2], a, pass2[3])
-                    )
-                )
-            )
-        )
-
-        fn v7BoundaryComponents comp groups maxGeomVert =
-        (
-            local boundaryAdj = #()
-            boundaryAdj.count = maxGeomVert
-            local boundaryVerts = #{}
-            local boundaryEdgeCount = 0
-            local trueOpenEdgeCount = 0
-
-            for gi = 1 to groups.count do
-            (
-                local g = groups[gi]
-                local insideCount = 0
-                for f in g[3] do if comp[f] do insideCount += 1
-                if insideCount == 1 do
-                (
-                    local a = g[1]
-                    local b = g[2]
-                    if a > 0 and b > 0 and a <= maxGeomVert and b <= maxGeomVert do
-                    (
-                        if boundaryAdj[a] == undefined do boundaryAdj[a] = #{}
-                        if boundaryAdj[b] == undefined do boundaryAdj[b] = #{}
-                        boundaryAdj[a][b] = true
-                        boundaryAdj[b][a] = true
-                        boundaryVerts[a] = true
-                        boundaryVerts[b] = true
-                        boundaryEdgeCount += 1
-                        if g[6] do trueOpenEdgeCount += 1
-                    )
-                )
-            )
-
-            local components = #()
-            local seen = #{}
-            for sv in boundaryVerts do if not seen[sv] do
-            (
-                local bc = #{}
-                local q = #(sv)
-                local qi = 1
-                seen[sv] = true
-                while qi <= q.count do
-                (
-                    local cv = q[qi]
-                    qi += 1
-                    bc[cv] = true
-                    if boundaryAdj[cv] != undefined do
-                    (
-                        for nv in boundaryAdj[cv] do if not seen[nv] do
-                        (
-                            seen[nv] = true
-                            append q nv
-                        )
-                    )
-                )
-                if not bc.isEmpty do append components bc
-            )
-            #(components, boundaryVerts, boundaryEdgeCount, trueOpenEdgeCount)
-        )
-
-        fn v7ComponentVerts comp groups =
-        (
-            local verts = #{}
-            for gi = 1 to groups.count do
-            (
-                local g = groups[gi]
-                local inside = false
-                for f in g[3] while not inside do if comp[f] do inside = true
-                if inside do
-                (
-                    verts[g[1]] = true
-                    verts[g[2]] = true
-                )
-            )
-            verts
-        )
-
-        fn v7AppendPathGroups pathGroups candidateGroups groups =
-        (
-            local added = 0
-            if pathGroups != undefined do
-            (
-                for gi in pathGroups do
-                (
-                    if gi > 0 and gi <= groups.count do
-                    (
-                        local g = groups[gi]
-                        -- Never propose a true open geometry boundary, and never
-                        -- re-propose an already split UV edge.
-                        if not g[6] and not g[7] and not candidateGroups[gi] do
-                        (
-                            candidateGroups[gi] = true
-                            added += 1
-                        )
-                    )
-                )
-            )
-            added
-        )
-
-        -- V7.2 path append: terminal-cap interiors are protected. The terminal
-        -- separator loop itself is allowed, but any ordinary seam group whose
-        -- incident faces lie completely inside a protected cap is rejected.
-        -- This makes a longitudinal/relief seam terminate at the cap loop rather
-        -- than continuing through a triangulated pole or radial fan.
-        fn v72AppendPathGroupsProtected pathGroups candidateGroups groups protectedCapFaces terminalLoopGroups =
-        (
-            local added = 0
-            if pathGroups != undefined do
-            (
-                for gi in pathGroups do
-                (
-                    if gi > 0 and gi <= groups.count do
-                    (
-                        local g = groups[gi]
-                        local isTerminalLoop = terminalLoopGroups != undefined and terminalLoopGroups[gi]
-                        local fullyInsideCap = false
-
-                        if protectedCapFaces != undefined and not protectedCapFaces.isEmpty and not isTerminalLoop do
-                        (
-                            local incidentCount = 0
-                            local protectedCount = 0
-                            for f in g[3] do
-                            (
-                                incidentCount += 1
-                                if protectedCapFaces[f] do protectedCount += 1
-                            )
-                            fullyInsideCap = incidentCount > 0 and protectedCount == incidentCount
-                        )
-
-                        if not fullyInsideCap and not g[6] and not g[7] and not candidateGroups[gi] do
-                        (
-                            candidateGroups[gi] = true
-                            added += 1
-                        )
-                    )
-                )
-            )
-            added
-        )
-
-        ----------------------------------------------------------------------
-        -- TERMINAL CAP SEPARATOR V7.2
-        --
-        -- This is deliberately NOT a general loop cutter. It searches only for
-        -- closed, smooth continuation loops that isolate a relatively small,
-        -- disk-like terminal region which does not touch an existing open mesh
-        -- boundary. Nested candidates are collapsed to one best loop, so a
-        -- rounded bottom does not receive a stack of concentric seams.
-        ----------------------------------------------------------------------
-
-        fn v71GroupInsideCount gi comp groups =
-        (
-            local c = 0
-            if gi > 0 and gi <= groups.count do
-            (
-                for f in groups[gi][3] do if comp[f] do c += 1
-            )
-            c
-        )
-
-        fn v71OtherGroupVertex gi v groups =
-        (
-            if gi <= 0 or gi > groups.count then 0
-            else
-            (
-                local g = groups[gi]
-                if g[1] == v then g[2] else if g[2] == v then g[1] else 0
-            )
-        )
-
-        fn v71BuildVertexGroups groups maxGeomVert comp =
-        (
-            local result = #()
-            result.count = maxGeomVert
-            for gi = 1 to groups.count do
-            (
-                if v71GroupInsideCount gi comp groups > 0 do
-                (
-                    local g = groups[gi]
-                    local a = g[1]
-                    local b = g[2]
-                    if a > 0 and a <= maxGeomVert do
-                    (
-                        if result[a] == undefined do result[a] = #()
-                        append result[a] gi
-                    )
-                    if b > 0 and b <= maxGeomVert do
-                    (
-                        if result[b] == undefined do result[b] = #()
-                        append result[b] gi
-                    )
-                )
-            )
-            result
-        )
-
-        fn v71TraceClosedLoop seedGI comp groups vertGroups geomMesh maxGeomVert =
-        (
-            if geomMesh == undefined or seedGI <= 0 or seedGI > groups.count then undefined
-            else
-            (
-                local sg = groups[seedGI]
-                if sg[6] or v71GroupInsideCount seedGI comp groups != 2 then undefined
-                else
-                (
-                    local startA = sg[1]
-                    local startB = sg[2]
-                    if startA <= 0 or startB <= 0 or startA > maxGeomVert or startB > maxGeomVert then undefined
-                    else
-                    (
-                        local nv = 0
-                        try(nv = getNumVerts geomMesh)catch(nv = 0)
-                        if startA > nv or startB > nv then undefined
-                        else
-                        (
-                            local loopGroups = #(seedGI)
-                            local used = #{seedGI}
-                            local prevV = startA
-                            local curV = startB
-                            local curGI = seedGI
-                            local closed = false
-                            local straightSum = 0.0
-                            local straightCount = 0
-                            local safety = 0
-                            local maxSteps = amin #(groups.count + 4, 4096)
-
-                            while not closed and safety < maxSteps do
-                            (
-                                safety += 1
-                                local pPrev = getVert geomMesh prevV
-                                local pCur = getVert geomMesh curV
-                                local inVec = pCur - pPrev
-                                if length inVec <= 0.0000001 then exit
-                                inVec = normalize inVec
-
-                                local bestGI = 0
-                                local bestV = 0
-                                local bestStraight = -2.0
-
-                                if curV > 0 and curV <= vertGroups.count and vertGroups[curV] != undefined do
-                                (
-                                    for ngi in vertGroups[curV] do
-                                    (
-                                        if ngi != curGI and not groups[ngi][6] and v71GroupInsideCount ngi comp groups == 2 do
-                                        (
-                                            local ov = v71OtherGroupVertex ngi curV groups
-                                            if ov > 0 and ov <= nv do
-                                            (
-                                                local canUse = not used[ngi]
-                                                if ngi == seedGI and curV == startA and ov == startB and loopGroups.count >= 3 do canUse = true
-                                                if canUse do
-                                                (
-                                                    local outVec = (getVert geomMesh ov) - pCur
-                                                    if length outVec > 0.0000001 do
-                                                    (
-                                                        outVec = normalize outVec
-                                                        local s = dot inVec outVec
-                                                        if s > bestStraight do
-                                                        (
-                                                            bestStraight = s
-                                                            bestGI = ngi
-                                                            bestV = ov
-                                                        )
-                                                    )
-                                                )
-                                            )
-                                        )
-                                    )
-                                )
-
-                                -- Smooth edge loops on production meshes normally continue
-                                -- with a positive tangent correlation. Reject right-angle
-                                -- wandering so the detector cannot invent arbitrary rings.
-                                if bestGI == 0 or bestStraight < 0.10 then exit
-
-                                if bestGI == seedGI and curV == startA and bestV == startB then
-                                (
-                                    closed = true
-                                )
-                                else
-                                (
-                                    append loopGroups bestGI
-                                    used[bestGI] = true
-                                    straightSum += bestStraight
-                                    straightCount += 1
-                                    prevV = curV
-                                    curV = bestV
-                                    curGI = bestGI
-                                )
-                            )
-
-                            if not closed or loopGroups.count < 4 then undefined
-                            else
-                            (
-                                local avgStraight = if straightCount > 0 then straightSum / straightCount else 0.0
-                                #(loopGroups, avgStraight)
-                            )
-                        )
-                    )
-                )
-            )
-        )
-
-        fn v71SplitFacesByLoop comp loopGroups groups numFaces =
-        (
-            if loopGroups == undefined or loopGroups.count < 3 then undefined
-            else
-            (
-                local blocked = #{}
-                for gi in loopGroups do if gi > 0 and gi <= groups.count do blocked[gi] = true
-
-                local seedFace = 0
-                for gi in loopGroups while seedFace == 0 do
-                (
-                    if gi > 0 and gi <= groups.count do
-                    (
-                        for f in groups[gi][3] while seedFace == 0 do if comp[f] do seedFace = f
-                    )
-                )
-                if seedFace == 0 then undefined
-                else
-                (
-                    local faceAdj = #()
-                    faceAdj.count = numFaces
-                    for gi = 1 to groups.count do
-                    (
-                        if not blocked[gi] do
-                        (
-                            local g = groups[gi]
-                            if g[3].count == 2 do
-                            (
-                                local f1 = g[3][1]
-                                local f2 = g[3][2]
-                                if comp[f1] and comp[f2] do
-                                (
-                                    if faceAdj[f1] == undefined do faceAdj[f1] = #{}
-                                    if faceAdj[f2] == undefined do faceAdj[f2] = #{}
-                                    faceAdj[f1][f2] = true
-                                    faceAdj[f2][f1] = true
-                                )
-                            )
-                        )
-                    )
-
-                    local sideA = #{}
-                    local q = #(seedFace)
-                    local qi = 1
-                    sideA[seedFace] = true
-                    while qi <= q.count do
-                    (
-                        local f = q[qi]
-                        qi += 1
-                        if faceAdj[f] != undefined do
-                        (
-                            for nf in faceAdj[f] do if comp[nf] and not sideA[nf] do
-                            (
-                                sideA[nf] = true
-                                append q nf
-                            )
-                        )
-                    )
-
-                    local sideB = #{}
-                    for f in comp do if not sideA[f] do sideB[f] = true
-                    if sideA.isEmpty or sideB.isEmpty then undefined
-                    else if sideA.numberSet <= sideB.numberSet then #(sideA, sideB) else #(sideB, sideA)
-                )
-            )
-        )
-
-        fn v71FacesTouchBoundary faceSet boundaryVerts faceGeom =
-        (
-            local touch = false
-            if faceSet != undefined and boundaryVerts != undefined and not boundaryVerts.isEmpty do
-            (
-                for f in faceSet while not touch do
-                (
-                    if f > 0 and f <= faceGeom.count and faceGeom[f] != undefined do
-                    (
-                        for gv in faceGeom[f] while not touch do if gv > 0 and boundaryVerts[gv] do touch = true
-                    )
-                )
-            )
-            touch
-        )
-
-        fn v71FaceOverlapRatio a b =
-        (
-            if a == undefined or b == undefined or a.isEmpty or b.isEmpty then 0.0
-            else
-            (
-                local overlap = 0
-                for f in a do if b[f] do overlap += 1
-                local denom = amin #(a.numberSet, b.numberSet)
-                if denom < 1 then 0.0 else (overlap as float) / denom
-            )
-        )
-
-        fn v71TerminalCandidateCompare a b =
-        (
-            if a[1] > b[1] then -1 else if a[1] < b[1] then 1 else 0
-        )
-
-        fn v71FindTerminalLoops comp groups faceGeom geomMesh maxGeomVert boundaryVerts vertGraph avgLen maxStretch seamWeight numFaces =
-        (
-            local accepted = #()
-            if geomMesh == undefined or comp == undefined or comp.numberSet < 16 or boundaryVerts == undefined or boundaryVerts.isEmpty then return accepted
-
-            local compVerts = v7ComponentVerts comp groups
-            local vertGroups = v71BuildVertexGroups groups maxGeomVert comp
-            local dj = v7DijkstraFromSet boundaryVerts vertGraph maxGeomVert
-            local dists = dj[1]
-            local maxD = 0.0
-            for v in compVerts do if v > 0 and v <= dists.count and dists[v] < 1.0e29 and dists[v] > maxD do maxD = dists[v]
-            if maxD <= 0.000001 then return accepted
-
-            local candidates = #()
-            local loopCovered = #{}
-            local maxCapRatio = 0.30 - (0.10 * seamWeight)
-            if maxCapRatio < 0.16 do maxCapRatio = 0.16
-            local desiredRatio = 0.12 + ((maxStretch - 12.0) / 280.0)
-            if desiredRatio < 0.08 do desiredRatio = 0.08
-            if desiredRatio > 0.18 do desiredRatio = 0.18
-
-            for seedGI = 1 to groups.count do
-            (
-                if not loopCovered[seedGI] and not groups[seedGI][6] and v71GroupInsideCount seedGI comp groups == 2 do
-                (
-                    local trace = v71TraceClosedLoop seedGI comp groups vertGroups geomMesh maxGeomVert
-                    if trace != undefined do
-                    (
-                        local loopGroups = trace[1]
-                        for gi in loopGroups do loopCovered[gi] = true
-
-                        local split = v71SplitFacesByLoop comp loopGroups groups numFaces
-                        if split != undefined do
-                        (
-                            local capFaces = split[1]
-                            local capRatio = (capFaces.numberSet as float) / (comp.numberSet as float)
-                            if capFaces.numberSet >= 3 and capRatio <= maxCapRatio and not v71FacesTouchBoundary capFaces boundaryVerts faceGeom do
-                            (
-                                local capVerts = v7ComponentVerts capFaces groups
-                                local distSum = 0.0
-                                local distCount = 0
-                                for v in capVerts do if v > 0 and v <= dists.count and dists[v] < 1.0e29 do
-                                (
-                                    distSum += dists[v]
-                                    distCount += 1
-                                )
-                                local distScore = if distCount > 0 then (distSum / distCount) / maxD else 0.0
-                                if distScore > 1.0 do distScore = 1.0
-
-                                local sizeScore = 1.0 - (abs(capRatio - desiredRatio) / desiredRatio)
-                                if sizeScore < 0.0 do sizeScore = 0.0
-
-                                local foldSum = 0.0
-                                local loopLen = 0.0
-                                for gi in loopGroups do
-                                (
-                                    foldSum += amin #(1.0, groups[gi][5] / 90.0)
-                                    loopLen += groups[gi][8]
-                                )
-                                local foldScore = foldSum / loopGroups.count
-                                local straightScore = trace[2]
-                                if straightScore < 0.0 do straightScore = 0.0
-
-                                local edgeCountPenalty = 0.12 * sqrt(loopGroups.count as float)
-                                local score = (2.6 * distScore) + (1.5 * sizeScore) + (0.75 * straightScore) + (0.55 * foldScore) - edgeCountPenalty
-
-                                -- A terminal loop must be strongly remote from an existing
-                                -- open boundary. This is the key guard against arbitrary
-                                -- circular cuts through the middle of smooth surfaces.
-                                if distScore >= 0.48 and score >= 1.55 do append candidates #(score, loopGroups, capFaces, capRatio, distScore)
-                            )
-                        )
-                    )
-                )
-            )
-
-            if candidates.count > 1 do qsort candidates v71TerminalCandidateCompare
-
-            local acceptedCaps = #()
-            local maxLoops = 4
-            for cand in candidates while accepted.count < maxLoops do
-            (
-                local overlaps = false
-                for oldCap in acceptedCaps while not overlaps do if v71FaceOverlapRatio cand[3] oldCap > 0.35 do overlaps = true
-                if not overlaps do
-                (
-                    append accepted cand
-                    append acceptedCaps cand[3]
-                )
-            )
-            accepted
-        )
-
-
-        ----------------------------------------------------------------------
-        -- TOPOLOGY + EDGE-FLOW ATLAS V8
-        --
-        -- V8 adds a generic swept/strip detector before the V7.2 fallback.
-        -- It does NOT identify semantic object types.  A component is treated
-        -- as swept only when its geometry contains a strong dominant edge-flow
-        -- axis and repeated longitudinal structure.
-        --
-        -- For swept components:
-        --   * planar terminal/end faces are isolated with cap loops
-        --   * hard-surface longitudinal feature rails are kept as seam chains
-        --   * round/cylindrical cross-sections get ONE longitudinal opening rail
-        --   * short local bevel/support edges are rejected by span filtering
-        -- Components without strong swept structure use V7.2 unchanged.
-        ----------------------------------------------------------------------
-
-        fn v8GroupInsideComp gi comp groups =
-        (
-            local inside = false
-            if gi > 0 and gi <= groups.count do
-                for f in groups[gi][3] while not inside do if comp[f] do inside = true
-            inside
-        )
-
-        fn v8GeomEdgeDir gi groups geomMesh =
-        (
-            local d = undefined
-            if geomMesh != undefined and gi > 0 and gi <= groups.count do
-            (
-                local g = groups[gi]
-                local nv = 0
-                try(nv = getNumVerts geomMesh)catch(nv = 0)
-                if g[1] > 0 and g[2] > 0 and g[1] <= nv and g[2] <= nv do
-                (
-                    local p1 = getVert geomMesh g[1]
-                    local p2 = getVert geomMesh g[2]
-                    local v = p2 - p1
-                    if length v > 0.0000001 do d = normalize v
-                )
-            )
-            d
-        )
-
-        fn v8ComponentAxisData comp groups geomMesh maxGeomVert =
-        (
-            if geomMesh == undefined or comp == undefined or comp.isEmpty then return undefined
-
-            local seedGI = 0
-            local seedLen = -1.0
-            local totalLen = 0.0
-            for gi = 1 to groups.count do if v8GroupInsideComp gi comp groups do
-            (
-                local gl = groups[gi][8]
-                if gl > 0.0000001 do
-                (
-                    totalLen += gl
-                    if gl > seedLen do
-                    (
-                        seedLen = gl
-                        seedGI = gi
-                    )
-                )
-            )
-            if seedGI == 0 or totalLen <= 0.0000001 then return undefined
-
-            local seedDir = v8GeomEdgeDir seedGI groups geomMesh
-            if seedDir == undefined then return undefined
-
-            local axisSum = [0,0,0]
-            local coherentLen = 0.0
-            for gi = 1 to groups.count do if v8GroupInsideComp gi comp groups do
-            (
-                local d = v8GeomEdgeDir gi groups geomMesh
-                if d != undefined do
-                (
-                    local ad = abs(dot d seedDir)
-                    if ad >= 0.70 do
-                    (
-                        if (dot d seedDir) < 0 do d = -d
-                        local w = amax #(groups[gi][8], 0.0001)
-                        axisSum += d * w
-                        coherentLen += w
-                    )
-                )
-            )
-            if length axisSum <= 0.0000001 then return undefined
-            local axis = normalize axisSum
-
-            local alignedLen = 0.0
-            local alignedCount = 0
-            for gi = 1 to groups.count do if v8GroupInsideComp gi comp groups do
-            (
-                local d = v8GeomEdgeDir gi groups geomMesh
-                if d != undefined and abs(dot d axis) >= 0.88 do
-                (
-                    alignedLen += amax #(groups[gi][8], 0.0)
-                    alignedCount += 1
-                )
-            )
-            local alignedRatio = if totalLen > 0.0000001 then alignedLen / totalLen else 0.0
-
-            local compVerts = v7ComponentVerts comp groups
-            local minP = 1.0e30
-            local maxP = -1.0e30
-            local nv = 0
-            try(nv = getNumVerts geomMesh)catch(nv = 0)
-            for v in compVerts do if v > 0 and v <= nv do
-            (
-                local pr = dot (getVert geomMesh v) axis
-                if pr < minP do minP = pr
-                if pr > maxP do maxP = pr
-            )
-            local span = maxP - minP
-            if span <= 0.0000001 then return undefined
-
-            -- Strong enough to be a repeated/swept surface.  The ratio is kept
-            -- conservative so a teapot body or organic sculpt does not enter
-            -- the strip branch just because it has a few long edges.
-            local isSwept = (alignedCount >= 3 and alignedRatio >= 0.42)
-            #(isSwept, axis, minP, maxP, span, alignedRatio, alignedCount)
-        )
-
-        fn v8FaceCentroidGeom f faceGeom geomMesh =
-        (
-            local c = [0,0,0]
-            local cnt = 0
-            if geomMesh != undefined and f > 0 and f <= faceGeom.count and faceGeom[f] != undefined do
-            (
-                local nv = 0
-                try(nv = getNumVerts geomMesh)catch(nv = 0)
-                for gv in faceGeom[f] do if gv > 0 and gv <= nv do
-                (
-                    c += getVert geomMesh gv
-                    cnt += 1
-                )
-            )
-            if cnt > 0 then c / cnt else undefined
-        )
-
-        fn v8FindEndCapFaces comp axis minP maxP faceGeom faceNormals geomMesh =
-        (
-            local minFaces = #{}
-            local maxFaces = #{}
-            local span = maxP - minP
-            if span <= 0.0000001 then return #(minFaces,maxFaces)
-
-            local band = span * 0.12
-            for f in comp do
-            (
-                local c = v8FaceCentroidGeom f faceGeom geomMesh
-                if c != undefined do
-                (
-                    local pr = dot c axis
-                    local na = abs(dot faceNormals[f] axis)
-                    if na >= 0.78 do
-                    (
-                        if pr <= (minP + band) do minFaces[f] = true
-                        if pr >= (maxP - band) do maxFaces[f] = true
-                    )
-                )
-            )
-            #(minFaces,maxFaces)
-        )
-
-        fn v8CapBoundaryGroups capFaces comp groups =
-        (
-            local result = #{}
-            if capFaces == undefined or capFaces.isEmpty then return result
-            for gi = 1 to groups.count do
-            (
-                local inCap = 0
-                local inComp = 0
-                for f in groups[gi][3] do
-                (
-                    if comp[f] do inComp += 1
-                    if capFaces[f] do inCap += 1
-                )
-                if inComp >= 1 and inCap >= 1 and inCap < inComp do result[gi] = true
-            )
-            result
-        )
-
-        fn v8GroupsToVerts groupSet groups =
-        (
-            local verts = #{}
-            if groupSet != undefined do for gi in groupSet do if gi > 0 and gi <= groups.count do
-            (
-                verts[groups[gi][1]] = true
-                verts[groups[gi][2]] = true
-            )
-            verts
-        )
-
-        fn v8VertSetRoundness verts axis geomMesh =
-        (
-            if verts == undefined or verts.numberSet < 6 or geomMesh == undefined then return 1.0
-            local nv = 0
-            try(nv = getNumVerts geomMesh)catch(nv = 0)
-            local center = [0,0,0]
-            local cnt = 0
-            for v in verts do if v > 0 and v <= nv do
-            (
-                center += getVert geomMesh v
-                cnt += 1
-            )
-            if cnt < 6 then return 1.0
-            center /= cnt
-
-            local avgR = 0.0
-            local radii = #()
-            for v in verts do if v > 0 and v <= nv do
-            (
-                local dv = (getVert geomMesh v) - center
-                local axial = axis * (dot dv axis)
-                local r = length (dv - axial)
-                append radii r
-                avgR += r
-            )
-            if radii.count < 6 then return 1.0
-            avgR /= radii.count
-            if avgR <= 0.0000001 then return 1.0
-
-            local variance = 0.0
-            for r in radii do variance += (r-avgR)*(r-avgR)
-            variance /= radii.count
-            (sqrt variance) / avgR
-        )
-
-        fn v8RailRecordCompare a b =
-        (
-            if a[1] > b[1] then -1 else if a[1] < b[1] then 1 else 0
-        )
-
-        fn v8FindStructuralRailChains comp groups geomMesh axis minP maxP capFaces avgLen seamWeight maxGeomVert =
-        (
-            local result = #()
-            if geomMesh == undefined then return result
-            local span = maxP - minP
-            if span <= 0.0000001 then return result
-
-            local hardMin = 30.0 + 15.0 * seamWeight
-            local cand = #{}
-            local vertToGroups = #()
-            vertToGroups.count = maxGeomVert
-
-            for gi = 1 to groups.count do if v8GroupInsideComp gi comp groups do
-            (
-                local g = groups[gi]
-                local touchesCapInterior = false
-                local sideFaceCount = 0
-                for f in g[3] do if comp[f] do
-                (
-                    if capFaces != undefined and capFaces[f] then touchesCapInterior = true else sideFaceCount += 1
-                )
-
-                local d = v8GeomEdgeDir gi groups geomMesh
-                if d != undefined and sideFaceCount > 0 and not g[6] and abs(dot d axis) >= 0.84 and g[5] >= hardMin do
-                (
-                    cand[gi] = true
-                    local a = g[1]
-                    local b = g[2]
-                    if vertToGroups[a] == undefined do vertToGroups[a] = #()
-                    if vertToGroups[b] == undefined do vertToGroups[b] = #()
-                    append vertToGroups[a] gi
-                    append vertToGroups[b] gi
-                )
-            )
-
-            local seen = #{}
-            local records = #()
-            for seed in cand do if not seen[seed] do
-            (
-                local chain = #{}
-                local q = #(seed)
-                local qi = 1
-                seen[seed] = true
-                local cMin = 1.0e30
-                local cMax = -1.0e30
-                local foldSum = 0.0
-                local ec = 0
-
-                while qi <= q.count do
-                (
-                    local gi = q[qi]
-                    qi += 1
-                    chain[gi] = true
-                    local g = groups[gi]
-                    foldSum += g[5]
-                    ec += 1
-
-                    local nv = 0
-                    try(nv = getNumVerts geomMesh)catch(nv = 0)
-                    for v in #(g[1],g[2]) do if v > 0 and v <= nv do
-                    (
-                        local pr = dot (getVert geomMesh v) axis
-                        if pr < cMin do cMin = pr
-                        if pr > cMax do cMax = pr
-                        if vertToGroups[v] != undefined do for ngi in vertToGroups[v] do if cand[ngi] and not seen[ngi] do
-                        (
-                            seen[ngi] = true
-                            append q ngi
-                        )
-                    )
-                )
-
-                local chainSpan = cMax-cMin
-                local spanRatio = chainSpan/span
-                if ec > 0 and spanRatio >= 0.55 do
-                (
-                    local avgFold = foldSum/ec
-                    local score = spanRatio * (1.0 + avgFold/90.0)
-                    append records #(score,chain,spanRatio,avgFold)
-                )
-            )
-
-            if records.count > 1 do qsort records v8RailRecordCompare
-            local maxRails = 8
-            for r in records while result.count < maxRails do append result r
-            result
-        )
-
-        fn v8BuildComponentVertGraph comp groups avgLen seamWeight maxGeomVert protectedFaces =
-        (
-            local graph = #()
-            graph.count = maxGeomVert
-            for gi = 1 to groups.count do if v8GroupInsideComp gi comp groups do
-            (
-                local g = groups[gi]
-                local fullyProtected = false
-                if protectedFaces != undefined and not protectedFaces.isEmpty do
-                (
-                    local nInc = 0
-                    local nProt = 0
-                    for f in g[3] do if comp[f] do
-                    (
-                        nInc += 1
-                        if protectedFaces[f] do nProt += 1
-                    )
-                    fullyProtected = (nInc > 0 and nProt == nInc)
-                )
-
-                if not fullyProtected do
-                (
-                    local a = g[1]
-                    local b = g[2]
-                    local lenN = if g[8] > 0.0000001 then g[8]/avgLen else 1.0
-                    if lenN < 0.05 do lenN = 0.05
-                    local fold = amin #(1.0,g[5]/90.0)
-                    local cost = lenN * (1.0 - (0.18 + 0.35*(1.0-seamWeight))*fold)
-                    if g[7] do cost *= 0.05
-                    if g[6] do cost *= 0.02
-                    if cost < 0.0001 do cost = 0.0001
-                    if graph[a] == undefined do graph[a] = #()
-                    if graph[b] == undefined do graph[b] = #()
-                    append graph[a] #(b,gi,cost)
-                    append graph[b] #(a,gi,cost)
-                )
-            )
-            graph
-        )
-
-        fn v8TrySweptComponent comp groups faceGeom faceNormals geomMesh maxGeomVert avgLen maxStretch seamWeight numFaces candidateGroups =
-        (
-            local data = v8ComponentAxisData comp groups geomMesh maxGeomVert
-            if data == undefined or not data[1] then return #(false,0,0,0)
-
-            local axis = data[2]
-            local minP = data[3]
-            local maxP = data[4]
-            local caps = v8FindEndCapFaces comp axis minP maxP faceGeom faceNormals geomMesh
-            local capMin = caps[1]
-            local capMax = caps[2]
-            local capAll = copy capMin
-            for f in capMax do capAll[f]=true
-
-            local loopMin = v8CapBoundaryGroups capMin comp groups
-            local loopMax = v8CapBoundaryGroups capMax comp groups
-            local terminalLoops = 0
-            local chains = 0
-
-            if not loopMin.isEmpty do
-            (
-                local a = v7AppendPathGroups (loopMin as array) candidateGroups groups
-                if a > 0 do
-                (
-                    chains += 1
-                    terminalLoops += 1
-                )
-            )
-            if not loopMax.isEmpty do
-            (
-                local a = v7AppendPathGroups (loopMax as array) candidateGroups groups
-                if a > 0 do
-                (
-                    chains += 1
-                    terminalLoops += 1
-                )
-            )
-
-            local bData = v7BoundaryComponents comp groups maxGeomVert
-            local bSets = bData[1]
-
-            local endSetA = #{}
-            local endSetB = #{}
-            if not loopMin.isEmpty do endSetA = v8GroupsToVerts loopMin groups
-            if not loopMax.isEmpty do endSetB = v8GroupsToVerts loopMax groups
-
-            -- If a cap is absent, a true open boundary at that end becomes the
-            -- corresponding free end set. Pick by average projection.
-            if bSets.count > 0 do
-            (
-                local lowSet = undefined
-                local highSet = undefined
-                local lowP = 1.0e30
-                local highP = -1.0e30
-                local nv = 0
-                try(nv=getNumVerts geomMesh)catch(nv=0)
-                for bs in bSets do
-                (
-                    local sumP=0.0
-                    local cnt=0
-                    for v in bs do if v>0 and v<=nv do
-                    (
-                        sumP += dot (getVert geomMesh v) axis
-                        cnt += 1
-                    )
-                    if cnt>0 do
-                    (
-                        local ap=sumP/cnt
-                        if ap < lowP do
-                        (
-                            lowP = ap
-                            lowSet = bs
-                        )
-                        if ap > highP do
-                        (
-                            highP = ap
-                            highSet = bs
-                        )
-                    )
-                )
-                if endSetA.isEmpty and lowSet != undefined do endSetA = copy lowSet
-                if endSetB.isEmpty and highSet != undefined do endSetB = copy highSet
-            )
-
-            local roundScore = 1.0
-            if not loopMin.isEmpty then roundScore = amin #(roundScore, v8VertSetRoundness (v8GroupsToVerts loopMin groups) axis geomMesh)
-            if not loopMax.isEmpty then roundScore = amin #(roundScore, v8VertSetRoundness (v8GroupsToVerts loopMax groups) axis geomMesh)
-            if bSets.count > 0 do for bs in bSets do if bs.numberSet >= 6 do roundScore = amin #(roundScore, v8VertSetRoundness bs axis geomMesh)
-            local roundLike = (roundScore <= 0.18)
-
-            local rails = v8FindStructuralRailChains comp groups geomMesh axis minP maxP capAll avgLen seamWeight maxGeomVert
-
-            if roundLike then
-            (
-                -- Round/tubular wall: never cut every longitudinal segment. One
-                -- opening rail between the two end loops/boundaries is sufficient.
-                if not endSetA.isEmpty and not endSetB.isEmpty do
-                (
-                    local sideGraph = v8BuildComponentVertGraph comp groups avgLen seamWeight maxGeomVert capAll
-                    local pd = v7ShortestPathBetweenSets endSetA endSetB sideGraph maxGeomVert
-                    if pd != undefined do
-                    (
-                        local a = v72AppendPathGroupsProtected pd[1] candidateGroups groups capAll #{}
-                        if a > 0 do chains += 1
-                    )
-                )
-            )
-            else
-            (
-                -- Hard swept strip: accept only coherent high-dihedral rails that
-                -- span most of the component. Local bevel/support fragments fail
-                -- the span test and are ignored.
-                for rr in rails do
-                (
-                    local a = v72AppendPathGroupsProtected (rr[2] as array) candidateGroups groups capAll #{}
-                    if a > 0 do chains += 1
-                )
-
-                -- If no structural rail survived, still make one opening path
-                -- between terminal/open end sets so the side wall can unfold.
-                if rails.count == 0 and not endSetA.isEmpty and not endSetB.isEmpty do
-                (
-                    local sideGraph = v8BuildComponentVertGraph comp groups avgLen seamWeight maxGeomVert capAll
-                    local pd = v7ShortestPathBetweenSets endSetA endSetB sideGraph maxGeomVert
-                    if pd != undefined do
-                    (
-                        local a = v72AppendPathGroupsProtected pd[1] candidateGroups groups capAll #{}
-                        if a > 0 do chains += 1
-                    )
-                )
-            )
-
-            #(true,chains,terminalLoops,(if roundLike then 1 else 2))
-        )
-
-        fn atlasBuildGeneral maxStretch seamWeight =
-        (
-            seamSuggestedUVEdges = #{}
-            seamAnalysisValid = false
-            seamAnalysisNode = undefined
-            seamAnalysisFaceCount = 0
-            seamTargetFaces = #{}
-            seamTubeCount = 0
-            seamManualCount = 0
-            atlasChartCount = 0
-            atlasWorstEnergy = 0.0
-
-            if not ensureUnwrapReady() then return false
-
-            local numFaces = 0
-            try(numFaces = uv.numberPolygons())catch(numFaces = 0)
-            if numFaces < 1 then
-            (
-                setStatus "Atlas V8: no faces."
-                return false
-            )
-
-            local selectionData = getCurrentSelectionAsVertices()
-            local targetFaces = getActiveSelectionFaces selectionData
-            if targetFaces == undefined or targetFaces.isEmpty do targetFaces = getAllUVFaces()
-            if targetFaces == undefined or targetFaces.isEmpty then
-            (
-                setStatus "Atlas V8: no target faces."
-                return false
-            )
-
-            local node = activeUnwrapNode()
-            local geomMesh = undefined
-            try(if node != undefined do geomMesh = snapshotAsMesh node)catch(geomMesh = undefined)
-
-            local faceGeom = #()
-            faceGeom.count = numFaces
-            local faceNormals = for f = 1 to numFaces collect [0,0,1]
-            local edgeRecords = #()
-            local maxGeomVert = 0
-
-            for f = 1 to numFaces do
-            (
-                local n = [0,0,1]
-                try(n = uv.getNormal f)catch(n = [0,0,1])
-                if length n > 0.000001 then n = normalize n else n = [0,0,1]
-                faceNormals[f] = n
-
-                local np = 0
-                try(np = uv.numberPointsInFace f)catch(np = 0)
-                local gvs = #()
-                local tvs = #()
-                if np > 1 do
-                (
-                    for k = 1 to np do
-                    (
-                        local gv = 0
-                        local tv = 0
-                        try(gv = uv.getVertexGeomIndexFromFace f k)catch(gv = 0)
-                        try(tv = uv.getVertexIndexFromFace f k)catch(tv = 0)
-                        append gvs gv
-                        append tvs tv
-                        if gv > maxGeomVert do maxGeomVert = gv
-                    )
-                    for k = 1 to np do
-                    (
-                        local k2 = if k == np then 1 else k + 1
-                        local g1 = gvs[k]
-                        local g2 = gvs[k2]
-                        local t1 = tvs[k]
-                        local t2 = tvs[k2]
-                        if g1 > 0 and g2 > 0 and g1 != g2 do
-                        (
-                            local glo = if g1 < g2 then g1 else g2
-                            local ghi = if g1 < g2 then g2 else g1
-                            local tlo = 0
-                            local thi = 0
-                            if t1 > 0 and t2 > 0 and t1 != t2 do
-                            (
-                                tlo = if t1 < t2 then t1 else t2
-                                thi = if t1 < t2 then t2 else t1
-                            )
-                            append edgeRecords #(glo, ghi, f, tlo, thi)
-                        )
-                    )
-                )
-                faceGeom[f] = gvs
-            )
-
-            if edgeRecords.count < 1 or maxGeomVert < 1 then
-            (
-                if geomMesh != undefined do try(delete geomMesh)catch()
-                if selectionData != undefined do restoreUVSelection selectionData
-                setStatus "Atlas V8: geometry topology unavailable."
-                return false
-            )
-
-            qsort edgeRecords seamEdgeRecordCompare
-
-            -- Group: #(g1,g2,faces,tvPairs,dihedral,isTrueOpen,isExistingUVSeam,length)
-            local groups = #()
-            local i = 1
-            while i <= edgeRecords.count do
-            (
-                local g1 = edgeRecords[i][1]
-                local g2 = edgeRecords[i][2]
-                local faces = #()
-                local tvPairs = #()
-                local j = i
-                while j <= edgeRecords.count and edgeRecords[j][1] == g1 and edgeRecords[j][2] == g2 do
-                (
-                    append faces edgeRecords[j][3]
-                    if edgeRecords[j][4] > 0 and edgeRecords[j][5] > 0 do append tvPairs #(edgeRecords[j][4], edgeRecords[j][5])
-                    j += 1
-                )
-
-                local existing = false
-                if tvPairs.count > 1 do
-                (
-                    local bp = tvPairs[1]
-                    for q = 2 to tvPairs.count while not existing do
-                        if tvPairs[q][1] != bp[1] or tvPairs[q][2] != bp[2] do existing = true
-                )
-
-                local ang = 0.0
-                if faces.count > 1 do
-                (
-                    local dd = dot faceNormals[faces[1]] faceNormals[faces[2]]
-                    if dd > 1.0 do dd = 1.0
-                    if dd < -1.0 do dd = -1.0
-                    ang = acos dd
-                )
-
-                append groups #(g1,g2,faces,tvPairs,ang,(faces.count == 1),existing,seamGeomEdgeLength g1 g2 geomMesh)
-                i = j
-            )
-
-            -- Geometry face connectivity only. Existing UV seams do NOT split a
-            -- geometry component; true open edges naturally have only one face.
-            local faceAdj = for f = 1 to numFaces collect #{}
-            for gi = 1 to groups.count do
-            (
-                local g = groups[gi]
-                if g[3].count > 1 do
-                (
-                    local f1 = g[3][1]
-                    local f2 = g[3][2]
-                    if targetFaces[f1] and targetFaces[f2] do
-                    (
-                        faceAdj[f1][f2] = true
-                        faceAdj[f2][f1] = true
-                    )
-                )
-            )
-
-            local components = #()
-            local seenFaces = #{}
-            for sf in targetFaces do if not seenFaces[sf] do
-            (
-                local comp = #{}
-                local q = #(sf)
-                local qi = 1
-                seenFaces[sf] = true
-                while qi <= q.count do
-                (
-                    local cf = q[qi]
-                    qi += 1
-                    comp[cf] = true
-                    for nf in faceAdj[cf] do if targetFaces[nf] and not seenFaces[nf] do
-                    (
-                        seenFaces[nf] = true
-                        append q nf
-                    )
-                )
-                if not comp.isEmpty do append components comp
-            )
-
-            -- Intrinsic curvature is now ONLY a conservative trigger for one
-            -- relief slit on an otherwise already-open disk-like component.
-            -- It never creates rings/charts by itself.
-            local faceCurv = for f = 1 to numFaces collect 0.0
-            if geomMesh != undefined and maxGeomVert > 0 then
-            (
-                local angleSum = for v = 1 to maxGeomVert collect 0.0
-                local incident = for v = 1 to maxGeomVert collect 0
-                local globalBoundaryGV = #{}
-
-                for gi = 1 to groups.count do
-                (
-                    local g = groups[gi]
-                    if g[6] do
-                    (
-                        globalBoundaryGV[g[1]] = true
-                        globalBoundaryGV[g[2]] = true
-                    )
-                )
-
-                local nv = 0
-                try(nv = getNumVerts geomMesh)catch(nv = 0)
-                for f in targetFaces do
-                (
-                    local gvs = faceGeom[f]
-                    if gvs != undefined and gvs.count >= 3 do
-                    (
-                        local np = gvs.count
-                        for k = 1 to np do
-                        (
-                            local gp = gvs[if k == 1 then np else k - 1]
-                            local gc = gvs[k]
-                            local gn = gvs[if k == np then 1 else k + 1]
-                            if gp > 0 and gc > 0 and gn > 0 and gp <= nv and gc <= nv and gn <= nv do
-                            (
-                                local pp = getVert geomMesh gp
-                                local pc = getVert geomMesh gc
-                                local pn = getVert geomMesh gn
-                                local va = pp - pc
-                                local vb = pn - pc
-                                if length va > 0.0000001 and length vb > 0.0000001 do
-                                (
-                                    va = normalize va
-                                    vb = normalize vb
-                                    local dd = dot va vb
-                                    if dd > 1.0 do dd = 1.0
-                                    if dd < -1.0 do dd = -1.0
-                                    angleSum[gc] += acos dd
-                                    incident[gc] += 1
-                                )
-                            )
-                        )
-                    )
-                )
-
-                local vertCurv = for v = 1 to maxGeomVert collect 0.0
-                for v = 1 to maxGeomVert do
-                (
-                    if incident[v] > 0 and not globalBoundaryGV[v] do
-                        vertCurv[v] = abs(360.0 - angleSum[v]) / 360.0
-                )
-
-                for f in targetFaces do
-                (
-                    local gvs = faceGeom[f]
-                    if gvs != undefined and gvs.count > 0 do
-                    (
-                        local sumC = 0.0
-                        local cntC = 0
-                        for gv in gvs do if gv > 0 and gv <= maxGeomVert do
-                        (
-                            sumC += vertCurv[gv]
-                            cntC += 1
-                        )
-                        if cntC > 0 do faceCurv[f] = sumC / cntC
-                    )
-                )
-            )
-
-            local avgLen = 0.0
-            local lenCount = 0
-            for g in groups do if g[8] > 0.0000001 do
-            (
-                avgLen += g[8]
-                lenCount += 1
-            )
-            if lenCount > 0 then avgLen /= lenCount else avgLen = 1.0
-
-            local candidateGroups = #{}
-            local totalChains = 0
-            local totalTerminalLoops = 0
-            local totalOpenBoundaries = 0
-            local totalTrueOpenEdges = 0
-            local worstEnergy = 0.0
-
-            local totalSweptComponents = 0
-            local totalRoundSwept = 0
-            local totalHardSwept = 0
-
-            for comp in components do
-            (
-                -- V8 first tries a topology/edge-flow interpretation. If the
-                -- component is not strongly swept, the proven V7.2 logic below
-                -- remains the fallback.
-                local v8res = v8TrySweptComponent comp groups faceGeom faceNormals geomMesh maxGeomVert avgLen maxStretch seamWeight numFaces candidateGroups
-                if v8res != undefined and v8res[1] then
-                (
-                    totalSweptComponents += 1
-                    totalChains += v8res[2]
-                    totalTerminalLoops += v8res[3]
-                    if v8res[4] == 1 then totalRoundSwept += 1 else totalHardSwept += 1
-
-                    local bd8 = v7BoundaryComponents comp groups maxGeomVert
-                    totalOpenBoundaries += bd8[1].count
-                    totalTrueOpenEdges += bd8[4]
-                )
-                else
-                (
-                    local compVerts = v7ComponentVerts comp groups
-                    local boundaryData = v7BoundaryComponents comp groups maxGeomVert
-                    local boundarySets = boundaryData[1]
-                    local boundaryVerts = boundaryData[2]
-                    totalOpenBoundaries += boundarySets.count
-                    totalTrueOpenEdges += boundaryData[4]
-
-                    -- Build a geometry-vertex graph for this component. The cost is
-                    -- primarily geometric length. Existing seams/open borders are
-                    -- nearly free. Folded edges are mildly preferred, never enough
-                    -- to create the ring-cut explosion seen in V5/V6.
-                    local vertGraph = #()
-                    vertGraph.count = maxGeomVert
-                    for gi = 1 to groups.count do
-                    (
-                        local g = groups[gi]
-                        local inside = false
-                        for f in g[3] while not inside do if comp[f] do inside = true
-                        if inside do
-                        (
-                            local a = g[1]
-                            local b = g[2]
-                            local lenN = if g[8] > 0.0000001 then g[8] / avgLen else 1.0
-                            if lenN < 0.05 do lenN = 0.05
-                            local fold = amin #(1.0, g[5] / 90.0)
-                            local foldBias = 0.15 + (0.55 * (1.0 - seamWeight))
-                            local cost = lenN * (1.0 - foldBias * fold)
-                            if g[7] do cost *= 0.05
-                            if g[6] do cost *= 0.02
-                            if cost < 0.0001 do cost = 0.0001
-
-                            if vertGraph[a] == undefined do vertGraph[a] = #()
-                            if vertGraph[b] == undefined do vertGraph[b] = #()
-                            append vertGraph[a] #(b, gi, cost)
-                            append vertGraph[b] #(a, gi, cost)
-                        )
-                    )
-
-                    -- V7.2 ORDER: detect terminal caps FIRST. Their interior faces
-                    -- are then protected before any longitudinal/relief path is added.
-                    local protectedCapFaces = #{}
-                    local terminalLoopGroups = #{}
-                    local terminalLoops = v71FindTerminalLoops comp groups faceGeom geomMesh maxGeomVert boundaryVerts vertGraph avgLen maxStretch seamWeight numFaces
-                    if terminalLoops != undefined do
-                    (
-                        for tc in terminalLoops do
-                        (
-                            for f in tc[3] do protectedCapFaces[f] = true
-                            for gi in tc[2] do terminalLoopGroups[gi] = true
-
-                            local addedLoop = v7AppendPathGroups tc[2] candidateGroups groups
-                            if addedLoop > 0 do
-                            (
-                                totalChains += 1
-                                totalTerminalLoops += 1
-                            )
-                        )
-                    )
-
-                    -- A) Multiple open boundary components: connect them with the
-                    -- minimum number of open paths. Terminal-cap interiors are
-                    -- forbidden, so a path can meet the separator but cannot cross it.
-                    if boundarySets.count > 1 then
-                    (
-                        local rootSet = copy boundarySets[1]
-                        for bi = 2 to boundarySets.count do
-                        (
-                            local pathData = v7ShortestPathBetweenSets rootSet boundarySets[bi] vertGraph maxGeomVert
-                            if pathData != undefined do
-                            (
-                                local added = v72AppendPathGroupsProtected pathData[1] candidateGroups groups protectedCapFaces terminalLoopGroups
-                                if added > 0 do totalChains += 1
-                            )
-                            for v in boundarySets[bi] do rootSet[v] = true
-                        )
-                    )
-                    else if boundarySets.count == 0 then
-                    (
-                        -- B) Completely closed component: one conservative diameter
-                        -- slit is the minimum starting cut. V7.2 still protects any
-                        -- terminal regions if future closed-component detection adds them.
-                        local dia = v7DiameterPath compVerts vertGraph maxGeomVert
-                        if dia != undefined do
-                        (
-                            local added = v72AppendPathGroupsProtected dia[1] candidateGroups groups protectedCapFaces terminalLoopGroups
-                            if added > 0 do totalChains += 1
-                        )
-                    )
-                    else
-                    (
-                        -- C) One open boundary: add at most one relief slit. If its
-                        -- farthest route enters a separated terminal cap, V7.2 clips
-                        -- the interior portion so the seam ends at the cap loop.
-                        local energy = 0.0
-                        for f in comp do if not protectedCapFaces[f] do energy += faceCurv[f]
-                        if energy > worstEnergy do worstEnergy = energy
-
-                        local activeFaceCount = comp.numberSet - protectedCapFaces.numberSet
-                        if activeFaceCount < 1 do activeFaceCount = comp.numberSet
-                        local faceScale = sqrt (amax #(1.0, activeFaceCount as float))
-                        local normalizedEnergy = energy / faceScale
-                        local reliefThreshold = 0.020 + (maxStretch / 40.0) * 0.080 + seamWeight * 0.050
-
-                        if activeFaceCount >= 12 and normalizedEnergy > reliefThreshold do
-                        (
-                            local relief = v7FarthestPathFromSet boundarySets[1] compVerts vertGraph maxGeomVert
-                            if relief != undefined do
-                            (
-                                local added = v72AppendPathGroupsProtected relief[1] candidateGroups groups protectedCapFaces terminalLoopGroups
-                                if added > 0 do totalChains += 1
-                            )
-                        )
-                    )
-                )
-            )
-            -- Convert geometry-edge seam chains to actual UV edge IDs.
-            local candidateTVPairs = #()
-            for gi in candidateGroups do for tp in groups[gi][4] do seamAppendUniquePair tp candidateTVPairs
-
-            local allUVEdges = #{}
-            try
-            (
-                uv.setTVSubObjectMode 3
-                uv.selectFaces targetFaces
-                uv.faceToEdgeSelect()
-                allUVEdges = copy (uv.getSelectedEdges())
-            )
-            catch(allUVEdges = #{})
-
-            if not allUVEdges.isEmpty and candidateTVPairs.count > 0 do
-            (
-                uv.setTVSubObjectMode 2
-                for eid in allUVEdges do
-                (
-                    local edgeVerts = #()
-                    try
-                    (
-                        uv.selectEdges #{eid}
-                        uv.edgeToVertSelect()
-                        edgeVerts = uv.getSelectedVertices() as array
-                    )
-                    catch(edgeVerts = #())
-                    if edgeVerts.count == 2 do
-                    (
-                        local lo = if edgeVerts[1] < edgeVerts[2] then edgeVerts[1] else edgeVerts[2]
-                        local hi = if edgeVerts[1] < edgeVerts[2] then edgeVerts[2] else edgeVerts[1]
-                        if seamPairExists #(lo,hi) candidateTVPairs do seamSuggestedUVEdges[eid] = true
-                    )
-                )
-            )
-
-            if geomMesh != undefined do try(delete geomMesh)catch()
-            if selectionData != undefined do restoreUVSelection selectionData
-
-            seamAnalysisNode = node
-            seamAnalysisFaceCount = numFaces
-            seamTargetFaces = copy targetFaces
-            seamAnalysisValid = true
-            atlasChartCount = totalChains
-            atlasWorstEnergy = worstEnergy
-
-            if seamSuggestedUVEdges.isEmpty then
-                setStatus ("Atlas V8: " + totalOpenBoundaries as string + " open set(s) | swept " + totalSweptComponents as string + " | no extra seam needed.")
-            else
-                setStatus ("Atlas V8: " + totalChains as string + " chains | " + totalTerminalLoops as string + " cap loop(s) | " + seamSuggestedUVEdges.numberSet as string + " edges | swept " + totalSweptComponents as string + " (round " + totalRoundSwept as string + ", hard " + totalHardSwept as string + ")")
-
-            true
-        )
-
 
         ----------------------------------------------------------------------
         -- NATIVE UNFOLD V2 - libigl LSCM + SLIM solver
         --
-        -- This is deliberately separate from Auto Seam. Auto Seam remains the
-        -- V2.1 feature-aware planner. Native Unfold reads the CURRENT applied
+        -- This is deliberately separate from Auto Seam. Native Unfold reads
+        -- the CURRENT applied
         -- Peel/Pelt seam set, cuts only along those seams / true open borders,
         -- solves each resulting chart, and reconstructs explicit shared TV
         -- topology from chart vertex IDs returned by RotateUV_Unfold.exe.
         ----------------------------------------------------------------------
-        -- Minimum worker versions this script's file formats require. A stale .exe
-        -- next to a newer .ms used to fail with an unhelpful parse error; now the
-        -- mismatch is reported up front.
-        fn nativeWorkerVersion workerPath =
-        (
-            local v = undefined
-            if workerPath != undefined and doesFileExist workerPath do
-            (
-                local tmp = (getDir #temp) + "\\RotateUV_ver_" + (timestamp() as string) + ".txt"
-                local ec = -1
-                local cmd = "\"" + workerPath + "\" --version > \"" + tmp + "\" 2>&1"
-                try(HiddenDOSCommand cmd startpath:(getFilenamePath workerPath) exitCode:&ec)catch(ec = -1)
-                if ec == 0 and doesFileExist tmp do
-                (
-                    try
-                    (
-                        local fh = openFile tmp
-                        local line = readLine fh
-                        close fh
-                        local tok = filterString line " \t"
-                        if tok.count >= 2 do v = tok[2]
-                    )
-                    catch(v = undefined)
-                )
-                try(deleteFile tmp)catch()
-            )
-            v
-        )
-
-        fn nativeRound3 v =
-        (
-            local x = 0.0
-            try(x = v as float)catch(x = 0.0)
-            (((floor (x * 1000.0 + 0.5)) / 1000.0) as string)
-        )
-
-        fn nativeVersionAtLeast have want =
-        (
-            if have == undefined or want == undefined then false
-            else
-            (
-                local h = filterString have "."
-                local w = filterString want "."
-                local ok = true
-                local decided = false
-                for i = 1 to 3 while not decided do
-                (
-                    local hv = if i <= h.count then (try((h[i] as integer))catch(0)) else 0
-                    local wv = if i <= w.count then (try((w[i] as integer))catch(0)) else 0
-                    if hv > wv do (ok = true; decided = true)
-                    if hv < wv do (ok = false; decided = true)
-                )
-                ok
-            )
-        )
-
         fn nativeUnfoldFindWorker =
         (
             local candidates = #()
@@ -4483,32 +2668,15 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
 
         fn nativeUnfoldCollectGeomSeams =
         (
-            -- Collect applied Peel/Pelt seam edges as GEOMETRY vertex pairs.
-            --
-            -- The previous version called uv.selectEdges + uv.edgeToVertSelect once
-            -- per seam edge (a full API round trip each), then rescanned every face
-            -- and corner using a linear array search. That was O(E_seam * F * k) and
-            -- took minutes on a 100k-poly mesh. This builds the TV-pair set once from
-            -- the edge selection, then walks the faces a single time with O(1)
-            -- Hashtable lookups.
             local peltEdges = #{}
             try(peltEdges = copy (uv.getPeltSelectedSeams()))catch(peltEdges = #{})
             if peltEdges == undefined or peltEdges.isEmpty then return #()
 
-            local numFaces = 0
-            try(numFaces = uv.numberPolygons())catch(numFaces = 0)
-            if numFaces < 1 then return #()
-
-            local seamTVSet = seamNewPairSet()
-            local usedFallback = (seamTVSet == undefined)
             local seamTVPairs = #()
-
-            -- One pass over the selected seam edges to get their TV endpoints.
             try
             (
                 uv.setTVSubObjectMode 2
-                local edgeList = peltEdges as array
-                for eid in edgeList do
+                for eid in peltEdges do
                 (
                     local edgeVerts = #()
                     try
@@ -4520,60 +2688,47 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                     catch(edgeVerts = #())
                     if edgeVerts.count == 2 do
                     (
-                        if usedFallback then
-                        (
-                            local tlo = if edgeVerts[1] < edgeVerts[2] then edgeVerts[1] else edgeVerts[2]
-                            local thi = if edgeVerts[1] < edgeVerts[2] then edgeVerts[2] else edgeVerts[1]
-                            seamAppendUniquePair #(tlo,thi) seamTVPairs
-                        )
-                        else seamSetAdd seamTVSet edgeVerts[1] edgeVerts[2]
+                        local tlo = if edgeVerts[1] < edgeVerts[2] then edgeVerts[1] else edgeVerts[2]
+                        local thi = if edgeVerts[1] < edgeVerts[2] then edgeVerts[2] else edgeVerts[1]
+                        seamAppendUniquePair #(tlo,thi) seamTVPairs
                     )
                 )
             )
             catch()
 
-            -- Single pass over the faces, mapping matching TV edges to geometry edges.
-            local geomSet = seamNewPairSet()
             local geomPairs = #()
-            for f = 1 to numFaces do
+            local numFaces = 0
+            try(numFaces = uv.numberPolygons())catch(numFaces = 0)
+            if seamTVPairs.count > 0 do
             (
-                local n = 0
-                try(n = uv.numberPointsInFace f)catch(n = 0)
-                if n > 1 do
+                for f = 1 to numFaces do
                 (
-                    for k = 1 to n do
+                    local n = 0
+                    try(n = uv.numberPointsInFace f)catch(n = 0)
+                    if n > 1 do
                     (
-                        local k2 = if k == n then 1 else k + 1
-                        local tv1 = 0
-                        local tv2 = 0
-                        try(tv1 = uv.getVertexIndexFromFace f k)catch(tv1 = 0)
-                        try(tv2 = uv.getVertexIndexFromFace f k2)catch(tv2 = 0)
-                        if tv1 > 0 and tv2 > 0 and tv1 != tv2 do
+                        for k = 1 to n do
                         (
-                            local isSeam = false
-                            if usedFallback then
+                            local k2 = if k == n then 1 else k + 1
+                            local tv1 = 0
+                            local tv2 = 0
+                            local g1 = 0
+                            local g2 = 0
+                            try(tv1 = uv.getVertexIndexFromFace f k)catch(tv1 = 0)
+                            try(tv2 = uv.getVertexIndexFromFace f k2)catch(tv2 = 0)
+                            if tv1 > 0 and tv2 > 0 and tv1 != tv2 do
                             (
                                 local tlo = if tv1 < tv2 then tv1 else tv2
                                 local thi = if tv1 < tv2 then tv2 else tv1
-                                isSeam = seamPairExists #(tlo,thi) seamTVPairs
-                            )
-                            else isSeam = seamSetHas seamTVSet tv1 tv2
-
-                            if isSeam do
-                            (
-                                local g1 = 0
-                                local g2 = 0
-                                try(g1 = uv.getVertexGeomIndexFromFace f k)catch(g1 = 0)
-                                try(g2 = uv.getVertexGeomIndexFromFace f k2)catch(g2 = 0)
-                                if g1 > 0 and g2 > 0 and g1 != g2 do
+                                if seamPairExists #(tlo,thi) seamTVPairs do
                                 (
-                                    local glo = if g1 < g2 then g1 else g2
-                                    local ghi = if g1 < g2 then g2 else g1
-                                    if geomSet == undefined then seamAppendUniquePair #(glo,ghi) geomPairs
-                                    else if not (seamSetHas geomSet glo ghi) do
+                                    try(g1 = uv.getVertexGeomIndexFromFace f k)catch(g1 = 0)
+                                    try(g2 = uv.getVertexGeomIndexFromFace f k2)catch(g2 = 0)
+                                    if g1 > 0 and g2 > 0 and g1 != g2 do
                                     (
-                                        seamSetAdd geomSet glo ghi
-                                        append geomPairs #(glo,ghi)
+                                        local glo = if g1 < g2 then g1 else g2
+                                        local ghi = if g1 < g2 then g2 else g1
+                                        seamAppendUniquePair #(glo,ghi) geomPairs
                                     )
                                 )
                             )
@@ -4669,8 +2824,7 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
             if inp == undefined then return #(false, "Native Unfold did not create a readable result.", 0, 0)
 
             local header = readLine inp
-            local headerTok = if header != undefined then filterString header " \t" else #()
-            if headerTok.count < 2 or headerTok[1] != "RUVUV" then
+            if header != "RUVUV 1" then
             (
                 try(close inp)catch()
                 return #(false, "Invalid Native Unfold result header. Rebuild RotateUV_Unfold.exe.", 0, 0)
@@ -4682,50 +2836,28 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                 return #(false, "Native Unfold worker returned an error.", 0, 0)
             )
 
-            -- Header records are read by name until FACES, so a worker that adds new
-            -- quality metrics stays readable by an older script and vice versa.
-            local chartCount = 0
-            local flipCount = 0
-            local resultFaceCount = -1
-            local maxStretch = 0.0
-            local meanStretch = 0.0
-            local overlapCount = 0
-            local guard = 0
-            local headerEOF = false
-            while resultFaceCount < 0 and guard < 64 and not headerEOF do
+            local chartsLine = readLine inp
+            local chartTok = if chartsLine != undefined then filterString chartsLine " \t" else #()
+            if chartTok.count < 2 or chartTok[1] != "CHARTS" then
             (
-                guard += 1
-                local line = readLine inp
-                if line == undefined then headerEOF = true
-                else
-                (
-                local tok = filterString line " \t"
-                if tok.count >= 2 do
-                (
-                    case tok[1] of
-                    (
-                        "CHARTS":   chartCount = tok[2] as integer
-                        "FLIPS":    flipCount = tok[2] as integer
-                        "OVERLAPS": overlapCount = tok[2] as integer
-                        "STRETCH":
-                        (
-                            maxStretch = tok[2] as float
-                            if tok.count >= 3 do meanStretch = tok[3] as float
-                        )
-                        "FACES":    resultFaceCount = tok[2] as integer
-                        default: ()
-                    )
-                )
-                )
+                try(close inp)catch()
+                return #(false, "Missing CHARTS record in Native Unfold result.", 0, 0)
             )
-            if resultFaceCount < 0 then
+            local chartCount = chartTok[2] as integer
+
+            local flipsLine = readLine inp
+            local flipTok = if flipsLine != undefined then filterString flipsLine " \t" else #()
+            local flipCount = 0
+            if flipTok.count >= 2 and flipTok[1] == "FLIPS" do flipCount = flipTok[2] as integer
+
+            local facesLine = readLine inp
+            local faceTok = if facesLine != undefined then filterString facesLine " \t" else #()
+            if faceTok.count < 2 or faceTok[1] != "FACES" then
             (
                 try(close inp)catch()
                 return #(false, "Missing FACES record in Native Unfold result.", chartCount, flipCount)
             )
-            nativeUnfoldLastStretch = maxStretch
-            nativeUnfoldLastMeanStretch = meanStretch
-            nativeUnfoldLastOverlaps = overlapCount
+            local resultFaceCount = faceTok[2] as integer
             local currentFaceCount = 0
             try(currentFaceCount = uv.numberPolygons())catch(currentFaceCount = 0)
             if resultFaceCount != currentFaceCount then
@@ -4842,19 +2974,6 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                         return runUnfold3D optimizeOnly:false
                     )
 
-                    -- Fail loudly on a stale worker rather than on a confusing parse error.
-                    local workerVer = nativeWorkerVersion worker
-                    if not (nativeVersionAtLeast workerVer "3.0.0") then
-                    (
-                        isBusy = false
-                        if selectionData != undefined do restoreUVSelection selectionData
-                        local vtxt = if workerVer == undefined then "unknown" else workerVer
-                        messageBox ("RotateUV_Unfold.exe is out of date (reports " + vtxt + ", needs 3.0.0 or newer).\n\nRebuild it with .github/workflows/build-windows.yml and copy it next to this script.") \
-                            title:"Rotate UV - Native Unfold"
-                        setStatus ("Native Unfold: worker " + vtxt + " too old; using Max Unfold3D.")
-                        return runUnfold3D optimizeOnly:false
-                    )
-
                     local tempDir = (getDir #temp) + "\\RotateUVNativeUnfold\\"
                     makeDir tempDir all:true
                     local tag = (timestamp()) as string
@@ -4888,11 +3007,7 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                             (
                                 result = true
                                 local flipText = if imported[4] > 0 then (" | " + imported[4] as string + " flip warning") else ""
-                                local ovlText = if nativeUnfoldLastOverlaps > 0 then (" | " + nativeUnfoldLastOverlaps as string + " overlap") else ""
-                                local stretchText = if nativeUnfoldLastStretch > 0.0 then \
-                                    (" | stretch max " + (nativeRound3 nativeUnfoldLastStretch) + " avg " + (nativeRound3 nativeUnfoldLastMeanStretch)) \
-                                    else ""
-                                setStatus ("Native Unfold: " + imported[3] as string + " charts" + stretchText + flipText + ovlText)
+                                setStatus ("Native Unfold: " + imported[3] as string + " charts | LSCM + SLIM" + flipText)
                             )
                             else
                             (
@@ -4928,28 +3043,6 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
             try(append candidates ((getDir #scripts) + "\\RotateUVAtlas\\RotateUV_AutoSeam.exe"))catch()
             for p in candidates do if p != undefined and doesFileExist p do return p
             undefined
-        )
-
-        fn nativeAutoSeamProfileBound =
-        (
-            case ddl_autoSeamProfile.selection of
-            (
-                1: 7.0
-                2: 5.5
-                3: 4.25
-                default: 7.0
-            )
-        )
-
-        fn nativeAutoSeamProfileName =
-        (
-            case ddl_autoSeamProfile.selection of
-            (
-                1: "Minimal Seams"
-                2: "Balanced"
-                3: "Low Distortion"
-                default: "Minimal Seams"
-            )
         )
 
         fn nativeAutoSeamExportOBJ outPath =
@@ -5152,17 +3245,11 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                 (
                     selectionData = getCurrentSelectionAsVertices()
                     local worker = nativeAutoSeamFindWorker()
-                    if worker != undefined and not (nativeVersionAtLeast (nativeWorkerVersion worker) "3.0.0") do
-                    (
-                        messageBox "RotateUV_AutoSeam.exe is out of date (needs 3.0.0 or newer). Rebuild it with the GitHub Actions workflow." \
-                            title:"Rotate UV - Auto Seam"
-                        worker = undefined
-                    )
                     if worker == undefined then
                     (
                         messageBox (
                             "RotateUV_AutoSeam.exe was not found.\n\n" +
-                            "Build the supplied Native Auto Seam V2 GitHub project, then place RotateUV_AutoSeam.exe beside this .ms/.mcr file."
+                            "Build the supplied Native Auto Seam V3.2 GitHub project, then place RotateUV_AutoSeam.exe beside this .ms/.mcr file."
                         ) title:"Rotate UV - Native Auto Seam"
                         setStatus "AUTO SEAM: native worker not found."
                     )
@@ -5184,10 +3271,9 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                         )
                         else
                         (
-                            local bound = nativeAutoSeamProfileBound()
                             local exitCode = -1
-                            local cmd = "\"" + worker + "\" \"" + inPath + "\" \"" + outPath + "\" " + (bound as string) + " 1 > \"" + logPath + "\" 2>&1"
-                            setStatus ("AUTO SEAM: planning structural seams | " + nativeAutoSeamProfileName())
+                            local cmd = "\"" + worker + "\" \"" + inPath + "\" \"" + outPath + "\" > \"" + logPath + "\" 2>&1"
+                            setStatus "AUTO SEAM: planning Professional Minimal Seams..."
                             try(HiddenDOSCommand cmd startpath:(getFilenamePath worker) prompt:"Rotate UV - optimizing native seams..." exitCode:&exitCode)catch(exitCode = -999)
 
                             if exitCode != 0 or not doesFileExist outPath then
@@ -5208,14 +3294,12 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                                     try(nFaces = uv.numberPolygons())catch(nFaces = 0)
                                     seamAnalysisFaceCount = nFaces
                                     seamAnalysisValid = true
-                                    atlasChartCount = parsed[3].count
-                                    atlasWorstEnergy = 0.0
                                     result = true
 
                                     local warn = ""
                                     if parsed[5] > 0 do warn += " | " + parsed[5] as string + " component fail"
                                     if parsed[6] > 0 do warn += " | " + parsed[6] as string + " unmatched tri"
-                                    setStatus ("AUTO SEAM: " + mappedCount as string + " Max edges | " + parsed[3].count as string + " cuts | " + nativeAutoSeamProfileName() + warn)
+                                    setStatus ("AUTO SEAM: " + mappedCount as string + " Max edges | " + parsed[3].count as string + " structural cuts" + warn)
                                 )
                                 else
                                 (
@@ -6031,18 +4115,6 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
         on btn_seamAnalyze pressed do seamAnalyze()
         on btn_seamPreview pressed do seamPreview()
         on btn_seamApply pressed do seamApply()
-        fn invalidateAtlasAnalysis reasonText =
-        (
-            seamAnalysisValid = false
-            seamSuggestedUVEdges = #{}
-            seamTargetFaces = #{}
-            atlasChartCount = 0
-            atlasWorstEnergy = 0.0
-            setStatus reasonText
-        )
-
-        on ddl_autoSeamProfile selected idx do invalidateAtlasAnalysis "Profile changed - Generate again."
-
         on btn_unfold pressed do runNativeUnfold()
         on btn_optimize pressed do runUnfold3D optimizeOnly:true
         on btn_straightenUV pressed do runStraightenUV()
@@ -6073,8 +4145,8 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                 "Optimize icon                 Gentle Unfold3D Optimize\n" +
                 "Straighten UV icon            Rectangularize selected quad-grid UV patches\n" +
                 "Straighten Shell icon         Rectangularize complete selected quad-grid shells\n\n" +
-                "NATIVE AUTO SEAM V2.5 FINAL - TOPOLOGY-AWARE MINIMAL SEAMS\n" +
-                "Workflow: Generate -> Preview -> Apply -> Native Unfold. Minimal Seams now analyzes logical surface patches and builds a maximum-quality spanning-tree of hinges, so large hard-surface areas stay connected and only cycle-breaking boundaries become seams. This is the default for Box, ChamferBox, furniture, bridge panels and similar converted Editable Poly geometry. Round Cylinder/Tube geometry uses structural cap loops plus controlled longitudinal/radial openings; smooth Torus geometry uses one meridian plus one longitude cycle. Freeform geometry falls back to the feature-aware planner. Native Unfold uses libigl LSCM + SLIM. True open mesh boundaries are never proposed as seams.\n\n" +
+                "PROFESSIONAL AUTO SEAM - SINGLE TOPOLOGY-AWARE MINIMAL-SEAM MODE\n" +
+                "Workflow: Generate -> Preview -> Apply -> Native Unfold. The seam workflow uses one automatic structural policy instead of user profiles. Hard-surface regions, rounded/tubular forms and freeform fallback are selected internally from geometry, keeping the UI deterministic and compact. Native Unfold uses libigl LSCM + SLIM. True open mesh boundaries are never proposed as seams.\n\n" +
                 "STRAIGHTEN\n" +
                 "Straighten UV detects clean rectangular quad-grid topology, finds four logical borders, then rebuilds a straight U/V grid using 3D-proportional spacing while preserving UV area and center. Straighten Shell applies the same solver to complete selected shells. Non-grid topology is skipped unchanged.\n\n" +
                 "ROTATION CENTER\n" +
@@ -6095,7 +4167,7 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
             lbl_credit.foreColor = (dotNetClass "System.Drawing.Color").FromArgb 145 145 145
             lbl_credit.backColor = (dotNetClass "System.Drawing.Color").FromArgb 68 68 68
             lbl_credit.font = dotNetObject "System.Drawing.Font" "Segoe UI" 7.0
-            setStatus "Ready - Native FEATURE-AWARE AUTO SEAM available."
+            setStatus "Ready - Professional Minimal Seams."
         )
     )
 
@@ -6127,5 +4199,12 @@ autoUndoEnabled:false
     RotateUV_Open()
 )
 
--- No auto-open here. Evaluating this script only registers the macro.
--- Run it from Customize -> Category "TEST" -> Rotate UV, or call RotateUV_Open().
+-- DEVELOPMENT AUTO-OPEN: Evaluate All opens the tool directly.
+try
+(
+    RotateUV_Open()
+)
+catch
+(
+    messageBox ("Rotate UV auto-open failed.\n\n" + getCurrentException()) title:"Rotate UV - Auto Open Error"
+)

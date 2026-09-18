@@ -51,7 +51,7 @@ def main():
         obj = os.path.join(fixdir, name + ".obj")
         mf.write_obj(mesh, obj)
         seams_path = os.path.join(fixdir, name + ".seams")
-        proc = subprocess.run([seamw, obj, seams_path, "7.0"], capture_output=True, text=True)
+        proc = subprocess.run([seamw, obj, seams_path], capture_output=True, text=True)
         if proc.returncode != 0:
             print("%-14s FAIL autoseam exit %d" % (name, proc.returncode))
             failures += 1
