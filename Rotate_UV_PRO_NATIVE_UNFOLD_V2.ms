@@ -74,6 +74,10 @@ fn RotateUV_Open =
         local capturedSelectionData = undefined
         local capturedMode = 1
         local isBusy = false
+        -- Quality metrics reported by the Native Unfold worker (RUVUV 2+).
+        local nativeUnfoldLastStretch = 0.0
+        local nativeUnfoldLastMeanStretch = 0.0
+        local nativeUnfoldLastOverlaps = 0
         local seamSuggestedUVEdges = #{}
         local seamAnalysisValid = false
         local seamAnalysisNode = undefined
@@ -2647,6 +2651,46 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
             else 0
         )
 
+        -- Pair membership used to be a linear array scan, which made seam
+        -- collection O(seamEdges * faces * corners). These use a .NET Hashtable
+        -- keyed on a single packed integer instead, so lookups are O(1).
+        fn seamPairKey a b =
+        (
+            local lo = if a < b then a else b
+            local hi = if a < b then b else a
+            ((lo as string) + "_" + (hi as string))
+        )
+
+        fn seamNewPairSet =
+        (
+            local ht = undefined
+            try(ht = dotNetObject "System.Collections.Hashtable")catch(ht = undefined)
+            ht
+        )
+
+        fn seamSetHas pairSet a b =
+        (
+            if pairSet == undefined then false
+            else
+            (
+                local ok = false
+                try(ok = pairSet.ContainsKey (seamPairKey a b))catch(ok = false)
+                ok
+            )
+        )
+
+        fn seamSetAdd pairSet a b =
+        (
+            if pairSet != undefined and a > 0 and b > 0 and a != b do
+            (
+                local k = seamPairKey a b
+                try(if not (pairSet.ContainsKey k) do pairSet.Add k true)catch()
+            )
+            pairSet
+        )
+
+        -- Retained for the legacy call sites; both now take the fast path when a
+        -- Hashtable is available and fall back to the array scan if .NET is not.
         fn seamPairExists pair pairArray =
         (
             local found = false
@@ -4369,6 +4413,62 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
         -- solves each resulting chart, and reconstructs explicit shared TV
         -- topology from chart vertex IDs returned by RotateUV_Unfold.exe.
         ----------------------------------------------------------------------
+        -- Minimum worker versions this script's file formats require. A stale .exe
+        -- next to a newer .ms used to fail with an unhelpful parse error; now the
+        -- mismatch is reported up front.
+        fn nativeWorkerVersion workerPath =
+        (
+            local v = undefined
+            if workerPath != undefined and doesFileExist workerPath do
+            (
+                local tmp = (getDir #temp) + "\\RotateUV_ver_" + (timestamp() as string) + ".txt"
+                local ec = -1
+                local cmd = "\"" + workerPath + "\" --version > \"" + tmp + "\" 2>&1"
+                try(HiddenDOSCommand cmd startpath:(getFilenamePath workerPath) exitCode:&ec)catch(ec = -1)
+                if ec == 0 and doesFileExist tmp do
+                (
+                    try
+                    (
+                        local fh = openFile tmp
+                        local line = readLine fh
+                        close fh
+                        local tok = filterString line " \t"
+                        if tok.count >= 2 do v = tok[2]
+                    )
+                    catch(v = undefined)
+                )
+                try(deleteFile tmp)catch()
+            )
+            v
+        )
+
+        fn nativeRound3 v =
+        (
+            local x = 0.0
+            try(x = v as float)catch(x = 0.0)
+            (((floor (x * 1000.0 + 0.5)) / 1000.0) as string)
+        )
+
+        fn nativeVersionAtLeast have want =
+        (
+            if have == undefined or want == undefined then false
+            else
+            (
+                local h = filterString have "."
+                local w = filterString want "."
+                local ok = true
+                local decided = false
+                for i = 1 to 3 while not decided do
+                (
+                    local hv = if i <= h.count then (try((h[i] as integer))catch(0)) else 0
+                    local wv = if i <= w.count then (try((w[i] as integer))catch(0)) else 0
+                    if hv > wv do (ok = true; decided = true)
+                    if hv < wv do (ok = false; decided = true)
+                )
+                ok
+            )
+        )
+
         fn nativeUnfoldFindWorker =
         (
             local candidates = #()
@@ -4383,15 +4483,32 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
 
         fn nativeUnfoldCollectGeomSeams =
         (
+            -- Collect applied Peel/Pelt seam edges as GEOMETRY vertex pairs.
+            --
+            -- The previous version called uv.selectEdges + uv.edgeToVertSelect once
+            -- per seam edge (a full API round trip each), then rescanned every face
+            -- and corner using a linear array search. That was O(E_seam * F * k) and
+            -- took minutes on a 100k-poly mesh. This builds the TV-pair set once from
+            -- the edge selection, then walks the faces a single time with O(1)
+            -- Hashtable lookups.
             local peltEdges = #{}
             try(peltEdges = copy (uv.getPeltSelectedSeams()))catch(peltEdges = #{})
             if peltEdges == undefined or peltEdges.isEmpty then return #()
 
+            local numFaces = 0
+            try(numFaces = uv.numberPolygons())catch(numFaces = 0)
+            if numFaces < 1 then return #()
+
+            local seamTVSet = seamNewPairSet()
+            local usedFallback = (seamTVSet == undefined)
             local seamTVPairs = #()
+
+            -- One pass over the selected seam edges to get their TV endpoints.
             try
             (
                 uv.setTVSubObjectMode 2
-                for eid in peltEdges do
+                local edgeList = peltEdges as array
+                for eid in edgeList do
                 (
                     local edgeVerts = #()
                     try
@@ -4403,47 +4520,60 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                     catch(edgeVerts = #())
                     if edgeVerts.count == 2 do
                     (
-                        local tlo = if edgeVerts[1] < edgeVerts[2] then edgeVerts[1] else edgeVerts[2]
-                        local thi = if edgeVerts[1] < edgeVerts[2] then edgeVerts[2] else edgeVerts[1]
-                        seamAppendUniquePair #(tlo,thi) seamTVPairs
+                        if usedFallback then
+                        (
+                            local tlo = if edgeVerts[1] < edgeVerts[2] then edgeVerts[1] else edgeVerts[2]
+                            local thi = if edgeVerts[1] < edgeVerts[2] then edgeVerts[2] else edgeVerts[1]
+                            seamAppendUniquePair #(tlo,thi) seamTVPairs
+                        )
+                        else seamSetAdd seamTVSet edgeVerts[1] edgeVerts[2]
                     )
                 )
             )
             catch()
 
+            -- Single pass over the faces, mapping matching TV edges to geometry edges.
+            local geomSet = seamNewPairSet()
             local geomPairs = #()
-            local numFaces = 0
-            try(numFaces = uv.numberPolygons())catch(numFaces = 0)
-            if seamTVPairs.count > 0 do
+            for f = 1 to numFaces do
             (
-                for f = 1 to numFaces do
+                local n = 0
+                try(n = uv.numberPointsInFace f)catch(n = 0)
+                if n > 1 do
                 (
-                    local n = 0
-                    try(n = uv.numberPointsInFace f)catch(n = 0)
-                    if n > 1 do
+                    for k = 1 to n do
                     (
-                        for k = 1 to n do
+                        local k2 = if k == n then 1 else k + 1
+                        local tv1 = 0
+                        local tv2 = 0
+                        try(tv1 = uv.getVertexIndexFromFace f k)catch(tv1 = 0)
+                        try(tv2 = uv.getVertexIndexFromFace f k2)catch(tv2 = 0)
+                        if tv1 > 0 and tv2 > 0 and tv1 != tv2 do
                         (
-                            local k2 = if k == n then 1 else k + 1
-                            local tv1 = 0
-                            local tv2 = 0
-                            local g1 = 0
-                            local g2 = 0
-                            try(tv1 = uv.getVertexIndexFromFace f k)catch(tv1 = 0)
-                            try(tv2 = uv.getVertexIndexFromFace f k2)catch(tv2 = 0)
-                            if tv1 > 0 and tv2 > 0 and tv1 != tv2 do
+                            local isSeam = false
+                            if usedFallback then
                             (
                                 local tlo = if tv1 < tv2 then tv1 else tv2
                                 local thi = if tv1 < tv2 then tv2 else tv1
-                                if seamPairExists #(tlo,thi) seamTVPairs do
+                                isSeam = seamPairExists #(tlo,thi) seamTVPairs
+                            )
+                            else isSeam = seamSetHas seamTVSet tv1 tv2
+
+                            if isSeam do
+                            (
+                                local g1 = 0
+                                local g2 = 0
+                                try(g1 = uv.getVertexGeomIndexFromFace f k)catch(g1 = 0)
+                                try(g2 = uv.getVertexGeomIndexFromFace f k2)catch(g2 = 0)
+                                if g1 > 0 and g2 > 0 and g1 != g2 do
                                 (
-                                    try(g1 = uv.getVertexGeomIndexFromFace f k)catch(g1 = 0)
-                                    try(g2 = uv.getVertexGeomIndexFromFace f k2)catch(g2 = 0)
-                                    if g1 > 0 and g2 > 0 and g1 != g2 do
+                                    local glo = if g1 < g2 then g1 else g2
+                                    local ghi = if g1 < g2 then g2 else g1
+                                    if geomSet == undefined then seamAppendUniquePair #(glo,ghi) geomPairs
+                                    else if not (seamSetHas geomSet glo ghi) do
                                     (
-                                        local glo = if g1 < g2 then g1 else g2
-                                        local ghi = if g1 < g2 then g2 else g1
-                                        seamAppendUniquePair #(glo,ghi) geomPairs
+                                        seamSetAdd geomSet glo ghi
+                                        append geomPairs #(glo,ghi)
                                     )
                                 )
                             )
@@ -4539,7 +4669,8 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
             if inp == undefined then return #(false, "Native Unfold did not create a readable result.", 0, 0)
 
             local header = readLine inp
-            if header != "RUVUV 1" then
+            local headerTok = if header != undefined then filterString header " \t" else #()
+            if headerTok.count < 2 or headerTok[1] != "RUVUV" then
             (
                 try(close inp)catch()
                 return #(false, "Invalid Native Unfold result header. Rebuild RotateUV_Unfold.exe.", 0, 0)
@@ -4551,28 +4682,50 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                 return #(false, "Native Unfold worker returned an error.", 0, 0)
             )
 
-            local chartsLine = readLine inp
-            local chartTok = if chartsLine != undefined then filterString chartsLine " \t" else #()
-            if chartTok.count < 2 or chartTok[1] != "CHARTS" then
-            (
-                try(close inp)catch()
-                return #(false, "Missing CHARTS record in Native Unfold result.", 0, 0)
-            )
-            local chartCount = chartTok[2] as integer
-
-            local flipsLine = readLine inp
-            local flipTok = if flipsLine != undefined then filterString flipsLine " \t" else #()
+            -- Header records are read by name until FACES, so a worker that adds new
+            -- quality metrics stays readable by an older script and vice versa.
+            local chartCount = 0
             local flipCount = 0
-            if flipTok.count >= 2 and flipTok[1] == "FLIPS" do flipCount = flipTok[2] as integer
-
-            local facesLine = readLine inp
-            local faceTok = if facesLine != undefined then filterString facesLine " \t" else #()
-            if faceTok.count < 2 or faceTok[1] != "FACES" then
+            local resultFaceCount = -1
+            local maxStretch = 0.0
+            local meanStretch = 0.0
+            local overlapCount = 0
+            local guard = 0
+            local headerEOF = false
+            while resultFaceCount < 0 and guard < 64 and not headerEOF do
+            (
+                guard += 1
+                local line = readLine inp
+                if line == undefined then headerEOF = true
+                else
+                (
+                local tok = filterString line " \t"
+                if tok.count >= 2 do
+                (
+                    case tok[1] of
+                    (
+                        "CHARTS":   chartCount = tok[2] as integer
+                        "FLIPS":    flipCount = tok[2] as integer
+                        "OVERLAPS": overlapCount = tok[2] as integer
+                        "STRETCH":
+                        (
+                            maxStretch = tok[2] as float
+                            if tok.count >= 3 do meanStretch = tok[3] as float
+                        )
+                        "FACES":    resultFaceCount = tok[2] as integer
+                        default: ()
+                    )
+                )
+                )
+            )
+            if resultFaceCount < 0 then
             (
                 try(close inp)catch()
                 return #(false, "Missing FACES record in Native Unfold result.", chartCount, flipCount)
             )
-            local resultFaceCount = faceTok[2] as integer
+            nativeUnfoldLastStretch = maxStretch
+            nativeUnfoldLastMeanStretch = meanStretch
+            nativeUnfoldLastOverlaps = overlapCount
             local currentFaceCount = 0
             try(currentFaceCount = uv.numberPolygons())catch(currentFaceCount = 0)
             if resultFaceCount != currentFaceCount then
@@ -4689,6 +4842,19 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                         return runUnfold3D optimizeOnly:false
                     )
 
+                    -- Fail loudly on a stale worker rather than on a confusing parse error.
+                    local workerVer = nativeWorkerVersion worker
+                    if not (nativeVersionAtLeast workerVer "3.0.0") then
+                    (
+                        isBusy = false
+                        if selectionData != undefined do restoreUVSelection selectionData
+                        local vtxt = if workerVer == undefined then "unknown" else workerVer
+                        messageBox ("RotateUV_Unfold.exe is out of date (reports " + vtxt + ", needs 3.0.0 or newer).\n\nRebuild it with .github/workflows/build-windows.yml and copy it next to this script.") \
+                            title:"Rotate UV - Native Unfold"
+                        setStatus ("Native Unfold: worker " + vtxt + " too old; using Max Unfold3D.")
+                        return runUnfold3D optimizeOnly:false
+                    )
+
                     local tempDir = (getDir #temp) + "\\RotateUVNativeUnfold\\"
                     makeDir tempDir all:true
                     local tag = (timestamp()) as string
@@ -4722,7 +4888,11 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                             (
                                 result = true
                                 local flipText = if imported[4] > 0 then (" | " + imported[4] as string + " flip warning") else ""
-                                setStatus ("Native Unfold: " + imported[3] as string + " charts | LSCM + SLIM" + flipText)
+                                local ovlText = if nativeUnfoldLastOverlaps > 0 then (" | " + nativeUnfoldLastOverlaps as string + " overlap") else ""
+                                local stretchText = if nativeUnfoldLastStretch > 0.0 then \
+                                    (" | stretch max " + (nativeRound3 nativeUnfoldLastStretch) + " avg " + (nativeRound3 nativeUnfoldLastMeanStretch)) \
+                                    else ""
+                                setStatus ("Native Unfold: " + imported[3] as string + " charts" + stretchText + flipText + ovlText)
                             )
                             else
                             (
@@ -4982,6 +5152,12 @@ Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UV
                 (
                     selectionData = getCurrentSelectionAsVertices()
                     local worker = nativeAutoSeamFindWorker()
+                    if worker != undefined and not (nativeVersionAtLeast (nativeWorkerVersion worker) "3.0.0") do
+                    (
+                        messageBox "RotateUV_AutoSeam.exe is out of date (needs 3.0.0 or newer). Rebuild it with the GitHub Actions workflow." \
+                            title:"Rotate UV - Auto Seam"
+                        worker = undefined
+                    )
                     if worker == undefined then
                     (
                         messageBox (
@@ -5951,12 +6127,5 @@ autoUndoEnabled:false
     RotateUV_Open()
 )
 
--- DEVELOPMENT AUTO-OPEN: Evaluate All opens the tool directly.
-try
-(
-    RotateUV_Open()
-)
-catch
-(
-    messageBox ("Rotate UV auto-open failed.\n\n" + getCurrentException()) title:"Rotate UV - Auto Open Error"
-)
+-- No auto-open here. Evaluating this script only registers the macro.
+-- Run it from Customize -> Category "TEST" -> Rotate UV, or call RotateUV_Open().

@@ -18,6 +18,15 @@
 
 namespace fs = std::filesystem;
 
+#define RUV_AUTOSEAM_VERSION "3.0.0"
+static bool g_verbose=false;
+// Edges deliberately added as structural openings (slits, region connectors).
+// pruneTinyBranches must never remove these: eating a slit turns a closed shell
+// back into a non-disk chart, which is how the cylinder ended up with 1 cut edge.
+struct EdgeKey;
+static std::set<EdgeKey> *g_protectedEdges=nullptr;
+static void diag(const std::string&msg){ if(g_verbose) std::cerr<<"[autoseam] "<<msg<<"\n"; }
+
 struct Vec3 { double x=0, y=0, z=0; };
 static Vec3 operator+(const Vec3&a,const Vec3&b){return {a.x+b.x,a.y+b.y,a.z+b.z};}
 static Vec3 operator-(const Vec3&a,const Vec3&b){return {a.x-b.x,a.y-b.y,a.z-b.z};}
@@ -340,6 +349,8 @@ static bool tryAxialStandardAssist(
     if(!dijkstraAxialSlit(m,t,rv,structuredLoops,src,dst,axis,slit))return false;
 
     cuts=structuredLoops;
+    if(g_protectedEdges) for(const auto&e:slit) g_protectedEdges->insert(e);
+    for(const auto&e:slit) cuts.insert(e);
     // Open every resulting band exactly once. For a solid cylinder this creates one
     // longitudinal side slit. For a hollow Tube it additionally opens the inner wall
     // and gives each annular cap one radial slit, producing clean rectangular/ring strips.
@@ -576,7 +587,7 @@ static void addLongitudinalOpenings(const ObjMesh&m,const MeshTopo&t,const std::
             // Connect the two boundary components with the largest centroid separation.
             int bi=0,bj=1;double best=-1;for(int i=0;i<(int)loops.size();++i)for(int j=i+1;j<(int)loops.size();++j){Vec3 a=verticesCentroid(m,loops[i]),b=verticesCentroid(m,loops[j]);double q=len2(b-a);if(q>best){best=q;bi=i;bj=j;}}
             std::unordered_set<int>A,B;for(auto&e:loops[bi]){A.insert(e.a);A.insert(e.b);}for(auto&e:loops[bj]){B.insert(e.a);B.insert(e.b);}Vec3 ca=verticesCentroid(m,loops[bi]),cb=verticesCentroid(m,loops[bj]);
-            std::vector<EdgeKey>path;if(shortestPathBetweenSets(m,t,rv,cuts,A,B,cb-ca,path)){for(auto&e:path)if(!t.edges.at(e).openBoundary)cuts.insert(e);}        
+            std::vector<EdgeKey>path;if(shortestPathBetweenSets(m,t,rv,cuts,A,B,cb-ca,path)){for(auto&e:path)if(!t.edges.at(e).openBoundary){cuts.insert(e);if(g_protectedEdges)g_protectedEdges->insert(e);}}        
         }else if(loops.empty() && p.addClosedFallback && r.size()>=12){
             // Closed smooth region fallback: create one long controlled slit rather than random little cuts.
             // Approximate a geodesic diameter with two Dijkstra-like sweeps on the edge graph.
@@ -585,17 +596,116 @@ static void addLongitudinalOpenings(const ObjMesh&m,const MeshTopo&t,const std::
                 std::vector<double>d(m.vertices.size()+1,std::numeric_limits<double>::infinity());std::vector<int>pr(m.vertices.size()+1,0);using Q=std::pair<double,int>;std::priority_queue<Q,std::vector<Q>,std::greater<Q>>pq;d[s]=0;pq.push({0,s});int far=s;
                 while(!pq.empty()){auto [cd,v]=pq.top();pq.pop();if(cd!=d[v])continue;if(cd>d[far])far=v;for(auto&e:t.vertexEdges[v]){if(cuts.count(e))continue;int o=(e.a==v?e.b:e.a);if(!rv.count(o))continue;double nd=cd+t.edges.at(e).length;if(nd<d[o]){d[o]=nd;pr[o]=v;pq.push({nd,o});}}}
                 if(prevOut)*prevOut=std::move(pr);return far;};
-            int a=farthest(seed,nullptr);std::vector<int>pr;int b=farthest(a,&pr);int cur=b;while(cur!=a&&pr[cur]){EdgeKey e(cur,pr[cur]);if(!t.edges.at(e).openBoundary)cuts.insert(e);cur=pr[cur];}
+            int a=farthest(seed,nullptr);std::vector<int>pr;int b=farthest(a,&pr);int cur=b;while(cur!=a&&pr[cur]){EdgeKey e(cur,pr[cur]);if(!t.edges.at(e).openBoundary){cuts.insert(e);if(g_protectedEdges)g_protectedEdges->insert(e);}cur=pr[cur];}
         }
     }
 }
 
 static void pruneTinyBranches(const MeshTopo&t,const Profile&p,std::set<EdgeKey>&cuts){
-    // Remove very short dangling seam twigs, but preserve loops and long connector paths.
+    // Remove very short dangling seam twigs, but preserve loops, long connector
+    // paths and anything registered as a structural opening.
     bool changed=true;double minLen=t.avgEdge*0.60;
     while(changed){changed=false;std::unordered_map<int,int>d;for(auto&e:cuts){d[e.a]++;d[e.b]++;}std::vector<EdgeKey>rm;
-        for(auto&e:cuts){if((d[e.a]==1||d[e.b]==1)&&t.edges.at(e).length<minLen)rm.push_back(e);}for(auto&e:rm)if(cuts.erase(e))changed=true;
+        for(auto&e:cuts){
+            if(g_protectedEdges && g_protectedEdges->count(e)) continue;
+            if((d[e.a]==1||d[e.b]==1)&&t.edges.at(e).length<minLen)rm.push_back(e);
+        }
+        for(auto&e:rm)if(cuts.erase(e))changed=true;
     }
+}
+
+// Euler characteristic of a closed component: 2 = sphere, 0 = torus.
+static bool componentClosedChi(const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,long long&chi){
+    std::unordered_set<int>fs(comp.begin(),comp.end()),vs;std::set<EdgeKey>es;bool open=false;
+    for(int f:comp) for(const auto&c:m.faces[f].c) vs.insert(c.v);
+    for(const auto&kv:t.edges){const auto&e=kv.second;int n=0;for(int f:e.faces)if(fs.count(f))n++;
+        if(n){es.insert(e.key);if(n==1)open=true;}}
+    if(open) return false;
+    chi=(long long)vs.size()-(long long)es.size()+(long long)comp.size();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Smooth closed genus-0 surface (sphere, ellipsoid, blob): the minimal cut is a
+// SINGLE pole-to-pole meridian. The old planner had no path for this - a smooth
+// sphere has no edge above featureAngle, so featureCycleCore came back empty and
+// the legacy fallback shredded it into ~170 scattered cut edges.
+// Poles are found from the valence anomaly of a UV sphere when present, and
+// otherwise from a graph-geodesic farthest pair, which is antipodal on a sphere.
+// ---------------------------------------------------------------------------
+static bool trySphereMeridian(const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,std::set<EdgeKey>&cuts){
+    if(comp.size()<24) return false;
+    long long chi=0;
+    if(!componentClosedChi(m,t,comp,chi)) return false;
+    if(chi!=2) return false;                                   // not genus 0, or not closed
+    if(componentSharpLengthFraction(t,comp,35.0)>0.10) return false;  // hard-surface: other paths own it
+
+    std::unordered_set<int> cf(comp.begin(),comp.end()), rv;
+    for(int f:comp) for(const auto&c:m.faces[f].c) rv.insert(c.v);
+    if(rv.size()<12) return false;
+
+    // component-local vertex valence
+    std::unordered_map<int,int> valence;
+    for(const auto&kv:t.edges){
+        const auto&e=kv.second;
+        bool inComp=false; for(int f:e.faces) if(cf.count(f)) inComp=true;
+        if(!inComp) continue;
+        valence[e.key.a]++; valence[e.key.b]++;
+    }
+    std::vector<int> vals; vals.reserve(valence.size());
+    for(const auto&kv:valence) vals.push_back(kv.second);
+    std::sort(vals.begin(),vals.end());
+    const int median = vals.empty()?4:vals[vals.size()/2];
+
+    std::vector<int> poles;
+    for(const auto&kv:valence) if(kv.second>=median+2) poles.push_back(kv.first);
+
+    auto dijkstra=[&](int s,std::vector<double>&d,std::vector<PrevRec>&pr){
+        const double INF=std::numeric_limits<double>::infinity();
+        d.assign(m.vertices.size()+1,INF); pr.assign(m.vertices.size()+1,PrevRec{});
+        using Q=std::pair<double,int>; std::priority_queue<Q,std::vector<Q>,std::greater<Q>>pq;
+        d[s]=0.0; pq.push({0.0,s});
+        int far=s;
+        while(!pq.empty()){
+            auto [cd,v]=pq.top();pq.pop(); if(cd!=d[v])continue;
+            if(cd>d[far]) far=v;
+            for(const auto&e:t.vertexEdges[v]){
+                const int o=(e.a==v?e.b:e.a);
+                if(!rv.count(o))continue;
+                auto it=t.edges.find(e); if(it==t.edges.end())continue;
+                const double nd=cd+it->second.length;
+                if(nd<d[o]){d[o]=nd;pr[o]={v,e,true};pq.push({nd,o});}
+            }
+        }
+        return far;
+    };
+
+    int A=0,B=0;
+    std::vector<double> d; std::vector<PrevRec> pr;
+    if(poles.size()==2){
+        A=poles[0]; B=poles[1];
+        dijkstra(A,d,pr);
+        if(!std::isfinite(d[B])) return false;
+    }else{
+        const int seed=*rv.begin();
+        const int a=dijkstra(seed,d,pr);
+        const int b=dijkstra(a,d,pr);
+        A=a; B=b;
+        if(A==B||!std::isfinite(d[B])) return false;
+    }
+
+    cuts.clear();
+    int cur=B;
+    int guard=0;
+    while(cur!=A && guard++ < (int)m.vertices.size()+4){
+        const auto&r=pr[cur];
+        if(!r.has) { cuts.clear(); return false; }
+        auto it=t.edges.find(r.e);
+        if(it!=t.edges.end() && !it->second.openBoundary) cuts.insert(r.e);
+        cur=r.v;
+    }
+    if(cur!=A){ cuts.clear(); return false; }
+    return cuts.size()>=3;
 }
 
 static std::set<EdgeKey> planFeatureAwareLegacy(const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,const Profile&p){
@@ -610,6 +720,8 @@ static std::set<EdgeKey> planFeatureAwareLegacy(const ObjMesh&m,const MeshTopo&t
 
 static std::set<EdgeKey> planFeatureAware(const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,const Profile&p){
     std::set<EdgeKey> structured;
+    std::set<EdgeKey> protectedEdges;
+    g_protectedEdges=&protectedEdges;
     const bool genusOne=componentEulerGenusOne(m,t,comp);
     const double sharpFrac=componentSharpLengthFraction(t,comp,35.0);
 
@@ -618,22 +730,42 @@ static std::set<EdgeKey> planFeatureAware(const ObjMesh&m,const MeshTopo&t,const
     // hard-surface objects use the generic patch adjacency spanning-tree net. Primitive names
     // are never required, so converted Editable Poly objects still receive the same treatment.
     bool matched=false;
-    if(sharpFrac>0.10) matched=tryAxialStandardAssist(m,t,comp,p,structured);
-    if(!matched && genusOne) matched=tryTorusIdealAssist(m,t,comp,structured);
-    if(!matched) matched=tryHardSurfaceIdealNet(m,t,comp,p,structured);
+    std::string path="legacy-feature-aware";
+    // No sharpFrac gate here: tryAxialStandardAssist already validates that it found
+    // genuinely round, co-axial, well-separated stations. The old gate (sharpFrac>0.10)
+    // rejected ordinary cylinders, whose cap creases are a small share of total edge
+    // length, and pushed them into the patch-net path which under-cut them.
+    if((matched=tryAxialStandardAssist(m,t,comp,p,structured))) path="axial";
+    if(!matched && genusOne && (matched=tryTorusIdealAssist(m,t,comp,structured))) path="torus";
+    if(!matched && (matched=trySphereMeridian(m,t,comp,structured))) path="sphere-meridian";
+    if(!matched && (matched=tryHardSurfaceIdealNet(m,t,comp,p,structured))) path="hard-surface-net";
+    diag("component faces="+std::to_string(comp.size())+
+         " sharpFrac="+std::to_string(sharpFrac)+
+         " genus1="+std::to_string((int)genusOne)+
+         " path="+path+
+         " rawCuts="+std::to_string(structured.size()));
 
     if(matched){
         for(auto it=structured.begin();it!=structured.end();){auto ei=t.edges.find(*it);if(ei!=t.edges.end()&&ei->second.openBoundary)it=structured.erase(it);else ++it;}
+        g_protectedEdges=nullptr;
         return structured;
     }
-    return planFeatureAwareLegacy(m,t,comp,p);
+    auto legacy=planFeatureAwareLegacy(m,t,comp,p);
+    g_protectedEdges=nullptr;
+    return legacy;
 }
 
 static double parseBound(const std::string&s){try{return std::stod(s);}catch(...){return 5.5;}}
 
+
 int main(int argc,char**argv){
+    for(int i=1;i<argc;i++){
+        if(std::string(argv[i])=="--version"){ std::cout<<"RotateUV_AutoSeam "<<RUV_AUTOSEAM_VERSION<<"\n"; return 0; }
+        if(std::string(argv[i])=="--verbose") g_verbose=true;
+    }
     if(argc<4){
-        std::cerr<<"RotateUV Native Auto Seam V2.5 FINAL - topology-aware Minimal Seams\nUsage: RotateUV_AutoSeam.exe input.obj output.seams profileBound [legacyInitialCut]\n";return 2;
+        std::cerr<<"RotateUV Native Auto Seam V"<<RUV_AUTOSEAM_VERSION<<" - topology-aware Minimal Seams\n"
+                   "Usage: RotateUV_AutoSeam.exe input.obj output.seams profileBound [--verbose]\n";return 2;
     }
     fs::path inputPath=fs::absolute(argv[1]);fs::path outputPath=fs::absolute(argv[2]);double bound=parseBound(argv[3]);Profile prof=profileFromBound(bound);
     ObjMesh mesh;std::string err;if(!readTriObj(inputPath,mesh,err)){std::cerr<<err<<"\n";return 4;}MeshTopo topo=buildTopo(mesh);auto comps=faceComponents(mesh);
@@ -647,6 +779,6 @@ int main(int argc,char**argv){
     out<<"SEAMS "<<allCuts.size()<<"\n";
     for(auto&e:allCuts)out<<"SEAM "<<e.a<<" "<<e.b<<"\n";
     out<<"END\n";out.close();
-    std::cout<<"RotateUV Native Auto Seam V2.5 FINAL: "<<allCuts.size()<<" seam edges | "<<prof.name<<" | components="<<comps.size()<<"\n";
+    std::cout<<"RotateUV Native Auto Seam V"<<RUV_AUTOSEAM_VERSION<<": "<<allCuts.size()<<" seam edges | "<<prof.name<<" | components="<<comps.size()<<"\n";
     return 0;
 }

@@ -1,33 +1,100 @@
-# RotateUV Native Unfold V2.5 FINAL
+# RotateUV Native Unfold V3.0.0
 
-## Final seam strategy
+A 3ds Max UV tool: MaxScript UI plus two standalone Windows workers, aiming at
+Maya-grade unfold results. See `CHANGES.md` for what changed from V2.5 and the
+measured before/after numbers.
 
-**Minimal Seams** is the default and no separate "Ideal Standard" profile is exposed.
+## Layout
 
-The auto-seam planner now works in this order:
+| Path | What it is |
+| --- | --- |
+| `Rotate_UV_PRO_NATIVE_UNFOLD_V2.ms` | the tool: UI, rotation, align, arrange, straighten, worker bridge |
+| `Rotate_UV_PRO_NATIVE_UNFOLD_V2.mcr` | macro registration only - safe to drop in the macros folder |
+| `src/unfold_worker.cpp` | Native Unfold: developable unroll + libigl LSCM/SLIM |
+| `src/autoseam_worker.cpp` | Auto Seam: topology-aware seam planner |
+| `tests/` | fixture generator and two regression suites |
+| `.github/workflows/build-windows.yml` | builds both workers and runs the tests |
 
-1. **Round Cylinder / Tube** - detects circular axial stations, creates only structural cap/wall separator loops, then adds controlled longitudinal and radial openings. Rounded rectangular ChamferBoxes are explicitly prevented from entering this path.
-2. **Smooth Torus** - uses one meridian cycle plus one longitude cycle.
-3. **Topology-aware hard-surface net** - collapses coplanar triangles into logical surface patches, builds the patch adjacency graph, then keeps a maximum-quality spanning tree as hinges. Only the remaining cycle-breaking patch boundaries are cut. Smooth bevel/chamfer transitions are preferred as hinges, while sharper corners are preferred seam locations. This applies to Box, ChamferBox, furniture, bridge panels, machinery and similar Editable Poly hard-surface models without relying on primitive names.
-4. **Feature-aware fallback** - retained for freeform meshes that do not confidently match the structured paths.
+## Install
 
-Native Unfold remains **libigl LSCM + SLIM** after seams are applied.
+1. Run the workflow (or build locally, see below) and download the artifact.
+2. Put `Rotate_UV_PRO_NATIVE_UNFOLD_V2.ms`, `RotateUV_Unfold.exe` and
+   `RotateUV_AutoSeam.exe` in the same folder, or in `<scripts>\RotateUVAtlas\`.
+3. Put the `.mcr` in your user macros folder. The button appears under
+   Customize -> Customize User Interface -> Category **TEST** -> Rotate UV.
 
-### Profiles
+The script requires workers **3.0.0 or newer** and says so plainly if it finds an
+older one. Native Unfold falls back to Max Unfold3D when no usable worker is found.
 
-1. Minimal Seams (default, topology-aware)
-2. Balanced
-3. Low Distortion
+## Unfold pipeline
 
-### Expected seam behavior
+Each chart is tried in this order, so the cheapest exact method wins:
 
-- Box: connected box-net style shell.
-- ChamferBox: connected panel/bevel net; avoids the old 2-3-edge under-cut and avoids treating the rounded rectangle as a Tube.
-- Cylinder: cap separator + one wall opening.
-- Hollow Tube: outer/inner structural loops plus controlled wall and annular-cap openings, not repeated random rings.
-- Torus: two fundamental opening cycles.
-- General hard-surface objects: large coherent surface groups remain connected wherever possible.
+1. **Planar projection** - flat charts, exact.
+2. **Developable unroll** - hinge-unfolds across the dual spanning tree. Exactly
+   isometric for cylinder walls, annuli, cones and box nets. Accepted only when
+   flip-free, within 1.0005 stretch and non-overlapping.
+3. **LSCM (or harmonic) init + SLIM** symmetric Dirichlet, for curved charts.
+4. **Axis projection** fallback for degenerate charts.
 
-### Build
+Then: measured distortion, auto-orientation onto an axis, relative texel-density
+normalization, and shelf packing with a quarter turn.
 
-Use `.github/workflows/build-windows.yml`. The workflow builds the Auto Seam worker and the libigl Native Unfold worker and uploads a Windows artifact.
+## Seam planner
+
+Component by component, first confident match wins:
+
+1. **Axial** - round co-axial stations (cylinder, tube, lathe): cap separator
+   loops plus one continuous longitudinal slit.
+2. **Torus** - genus 1 and smooth: one minor loop plus one major loop.
+3. **Sphere meridian** - closed, genus 0, smooth: one pole-to-pole cut.
+4. **Hard-surface patch net** - coplanar triangles collapsed into patches, then a
+   maximum-quality spanning tree of the patch graph kept as hinges. Smooth bevel
+   transitions are preferred as hinges, sharp corners as seams.
+5. **Feature-aware legacy** fallback for freeform meshes.
+
+Profiles: Minimal Seams (default), Balanced, Low Distortion.
+
+## Worker CLI
+
+```
+RotateUV_Unfold.exe in.ruvu out.ruvuv [slimIterations] [options]
+  --no-orient            keep the raw solver orientation
+  --no-preserve-scale    normalize each chart independently
+  --no-developable       skip the exact isometric unroll
+  --threads N            worker threads (default: hardware concurrency)
+  --padding F            atlas margin, 0..0.2 (default 0.02)
+  --version
+
+RotateUV_AutoSeam.exe in.obj out.seams profileBound [--verbose]
+  --verbose              report the planner path and cut count per component
+  --version
+```
+
+## Tests
+
+```
+python3 tests/make_fixtures.py
+python3 tests/run_tests.py    dist/RotateUV_Unfold.exe
+python3 tests/run_pipeline.py dist/RotateUV_AutoSeam.exe dist/RotateUV_Unfold.exe
+```
+
+`run_tests.py` recomputes distortion and flips independently from the fixture
+geometry rather than trusting the worker's own report. Fixtures carry the
+reference seam layouts: sphere = one meridian, cylinder = cap loops + one slit,
+torus = two fundamental loops, cube = cross net.
+
+Current status: solver suite 7/7, pipeline suite 5/6. The one failure is the
+stacked cylinder, documented under Known gaps in `CHANGES.md`.
+
+## Build locally (Linux, for testing the workers)
+
+```
+pip install --target tp cmeel-eigen
+curl -sL -o igl.tgz https://codeload.github.com/libigl/libigl/tar.gz/refs/tags/v2.6.0 && tar xzf igl.tgz
+g++ -O2 -std=c++17 -DNDEBUG -Ilibigl-2.6.0/include -Itp/cmeel.prefix/include/eigen3 \
+    src/unfold_worker.cpp -o RotateUV_Unfold -pthread
+g++ -O2 -std=c++17 -DNDEBUG src/autoseam_worker.cpp -o RotateUV_AutoSeam
+```
+
+Windows builds use MSVC via the GitHub Actions workflow, which is the supported path.
