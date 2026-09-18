@@ -18,7 +18,7 @@
 
 namespace fs = std::filesystem;
 
-#define RUV_AUTOSEAM_VERSION "3.0.0"
+#define RUV_AUTOSEAM_VERSION "3.0.1"
 static bool g_verbose=false;
 // Edges deliberately added as structural openings (slits, region connectors).
 // pruneTinyBranches must never remove these: eating a slit turns a closed shell
@@ -284,6 +284,79 @@ static bool dijkstraAxialSlit(
     std::reverse(path.begin(),path.end());return !path.empty();
 }
 
+// ---------------------------------------------------------------------------
+// Structural rings from concentrated Gaussian curvature.
+//
+// collectPlanarLoopCandidates can only see rings that bound a large *planar*
+// patch, so on a lathe it finds the two flat end caps and nothing else: the
+// shoulder rings between conical bands bound cones, not planes. The result was
+// one chart spanning a radius change, which cannot be unrolled isometrically
+// (a union of cones joined along a circle is not developable).
+//
+// The criterion used here is the one that actually matters to the solver: a
+// vertex carries Gaussian curvature when its angle defect is non-zero. A faceted
+// cylinder or cone wall has exactly zero defect at every interior vertex - a
+// fold is still developable - while cap rings and shoulder rings do not. So the
+// rings worth cutting are the closed, axis-perpendicular loops through
+// curvature-carrying vertices. No angle thresholds tuned per primitive.
+// ---------------------------------------------------------------------------
+static void addCurvatureRings(const ObjMesh&m,const MeshTopo&t,const std::unordered_set<int>&cf,
+                              const Vec3&axis,std::set<EdgeKey>&loops)
+{
+    // per-vertex angle defect over this component
+    std::unordered_map<int,double> angleSum;
+    std::unordered_map<int,int> faceCount;
+    for(int f:cf){
+        const auto&fc=m.faces[f];
+        for(int k=0;k<3;k++){
+            const int v=fc.c[k].v;
+            const Vec3 p=m.vertices[v-1];
+            const Vec3 a=m.vertices[fc.c[(k+1)%3].v-1];
+            const Vec3 b=m.vertices[fc.c[(k+2)%3].v-1];
+            const Vec3 e1=norm(a-p), e2=norm(b-p);
+            if(len2(e1)<1e-18||len2(e2)<1e-18) continue;
+            angleSum[v]+=std::acos(clampd(dot(e1,e2),-1.0,1.0));
+            faceCount[v]++;
+        }
+    }
+    const double TWO_PI=6.28318530717958647692;
+    // 0.02 rad (~1.15 deg) sits far above the numerical noise of a developable
+    // wall and far below the defect of any real cap or shoulder ring.
+    const double defectTol=0.02;
+    std::unordered_set<int> curved;
+    for(const auto&kv:angleSum){
+        if(faceCount[kv.first]<3) continue;                 // open border vertex
+        if(std::abs(TWO_PI-kv.second)>defectTol) curved.insert(kv.first);
+    }
+    if(curved.size()<6) return;
+
+    const Vec3 ax=norm(axis);
+    std::set<EdgeKey> ringEdges;
+    for(const auto&kv:t.edges){
+        const auto&e=kv.second;
+        if(e.faces.size()!=2) continue;
+        if(!cf.count(e.faces[0])||!cf.count(e.faces[1])) continue;
+        if(!curved.count(e.key.a)||!curved.count(e.key.b)) continue;
+        const Vec3 d=norm(m.vertices[e.key.b-1]-m.vertices[e.key.a-1]);
+        if(len2(d)<1e-18) continue;
+        if(std::abs(dot(d,ax))>0.35) continue;              // must run around the axis
+        ringEdges.insert(e.key);
+    }
+    if(ringEdges.empty()) return;
+
+    int added=0;
+    for(const auto&ec:edgeConnectedComponents(ringEdges)){
+        if(ec.size()<6||!looksLikeClosedLoop(ec)) continue;
+        for(const auto&e:ec){
+            auto it=t.edges.find(e);
+            if(it!=t.edges.end()&&!it->second.openBoundary){ loops.insert(e); ++added; }
+        }
+    }
+    diag("curvature rings: curvedVerts="+std::to_string(curved.size())+
+         " ringEdges="+std::to_string(ringEdges.size())+
+         " added="+std::to_string(added));
+}
+
 static bool tryAxialStandardAssist(
     const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,const Profile&p,std::set<EdgeKey>&cuts)
 {
@@ -338,6 +411,11 @@ static bool tryAxialStandardAssist(
 
     std::set<EdgeKey>structuredLoops;
     for(int idx:kept)for(auto&e:loops[idx].edges)structuredLoops.insert(e);
+    // Also take every ring where Gaussian curvature concentrates. On a plain
+    // cylinder this is the two cap rings already found; on a lathe it adds the
+    // shoulder rings between conical bands, which the planar-patch search cannot
+    // see and without which the lateral surface is not developable.
+    addCurvatureRings(m,t,cf,axis,structuredLoops);
     if(structuredLoops.size()<3)return false;
 
     // Create exactly one global longitudinal slit through all stations instead of one slit per

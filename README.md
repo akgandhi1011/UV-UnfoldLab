@@ -1,4 +1,4 @@
-# RotateUV Native Unfold V3.0.0
+# RotateUV Native Unfold V3.0.1
 
 A 3ds Max UV tool: MaxScript UI plus two standalone Windows workers, aiming at
 Maya-grade unfold results. See `CHANGES.md` for what changed from V2.5 and the
@@ -45,7 +45,8 @@ normalization, and shelf packing with a quarter turn.
 Component by component, first confident match wins:
 
 1. **Axial** - round co-axial stations (cylinder, tube, lathe): cap separator
-   loops plus one continuous longitudinal slit.
+   loops, plus every ring where Gaussian curvature concentrates (shoulder rings
+   between conical bands), plus one continuous longitudinal slit.
 2. **Torus** - genus 1 and smooth: one minor loop plus one major loop.
 3. **Sphere meridian** - closed, genus 0, smooth: one pole-to-pole cut.
 4. **Hard-surface patch net** - coplanar triangles collapsed into patches, then a
@@ -84,8 +85,9 @@ geometry rather than trusting the worker's own report. Fixtures carry the
 reference seam layouts: sphere = one meridian, cylinder = cap loops + one slit,
 torus = two fundamental loops, cube = cross net.
 
-Current status: solver suite 7/7, pipeline suite 5/6. The one failure is the
-stacked cylinder, documented under Known gaps in `CHANGES.md`.
+Current status: solver suite 7/7, pipeline suite 6/6. Fixtures whose target is an
+exact unroll assert 1.01 stretch, which is compiler-independent; only sphere and
+torus carry loose bounds, since those must go through SLIM.
 
 ## Build locally (Linux, for testing the workers)
 

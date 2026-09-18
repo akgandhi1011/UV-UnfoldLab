@@ -37,7 +37,7 @@
 #include <igl/map_vertices_to_circle.h>
 #include <igl/slim.h>
 
-#define RUV_UNFOLD_VERSION "3.0.0"
+#define RUV_UNFOLD_VERSION "3.0.1"
 
 struct Vec2 { double x=0.0, y=0.0; };
 struct Vec3 { double x=0.0, y=0.0, z=0.0; };

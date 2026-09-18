@@ -18,14 +18,19 @@ import run_tests as rt
 
 # name -> (max seam edges, max stretch)  -- seam cap catches shredding
 #
-# 1.01 means "the planner produced cuts the solver can unroll exactly".
-# lathe is a BASELINE LOCK, not a target: the axial planner currently keeps only
-# the two extreme station loops, so one chart still spans a radius change and
-# cannot be developable. Target is 1.01 once the planner keeps every station.
+# Two classes of threshold, deliberately:
+#   1.01  "the planner produced cuts the solver can unroll EXACTLY". The
+#         developable unroll is pure arithmetic, so this is 1.0000 to within
+#         floating-point noise on any compiler. Do not loosen it - if one of
+#         these regresses, a chart stopped being developable and the planner
+#         under-cut something.
+#   >1.01 inherently curved surfaces that must go through SLIM. These carry
+#         real margin because iterative solver output differs slightly between
+#         MSVC and GCC; they are not tight baselines.
 EXPECT = {
     "cube":        (12, 1.01),
     "cylinder":    (60, 1.01),
-    "lathe":       (130, 1.35),
+    "lathe":       (130, 1.01),
     "hollow_tube": (140, 1.01),
     "torus":       (40, 2.20),
     "sphere":      (20, 4.50),
