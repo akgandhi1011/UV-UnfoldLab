@@ -1,4 +1,4 @@
-name: Build RotateUV Native Unfold V2 + Standard Geometry V2.2
+name: Build RotateUV Native Unfold V2 + Ideal Standard Geometry V2.3
 
 on:
   workflow_dispatch:
@@ -63,7 +63,7 @@ jobs:
         shell: cmd
         run: if not exist dist mkdir dist
 
-      - name: Build Auto Seam V2.2 worker
+      - name: Build Ideal Auto Seam V2.3 worker
         shell: cmd
         run: |
           cl /nologo /O2 /DNDEBUG /std:c++17 /EHsc /MD src\autoseam_worker.cpp /Fe:dist\RotateUV_AutoSeam.exe
