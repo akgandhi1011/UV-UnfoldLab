@@ -116,6 +116,12 @@ jobs:
           python tests/run_pipeline.py dist\RotateUV_AutoSeam.exe dist\RotateUV_Unfold.exe
           if ($LASTEXITCODE -ne 0) { throw "Pipeline regression tests failed" }
 
+      - name: Desired-result real-model regression
+        shell: pwsh
+        run: |
+          python tests/run_reference_regression.py dist\RotateUV_AutoSeam.exe
+          if ($LASTEXITCODE -ne 0) { throw "Desired-result reference regression failed" }
+
       - name: Copy MaxScript and notices
         shell: pwsh
         run: |
